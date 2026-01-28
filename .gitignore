@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+
+# Environment Variables
+.env
+
+# Checkpoints / Output
+speecht5_laps_lora_exhaustive/
+#*.wav
+
+# Editor
+.vscode/
+.idea/
