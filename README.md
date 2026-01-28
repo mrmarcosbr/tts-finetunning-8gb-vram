@@ -1,6 +1,7 @@
 # tts-finetunning-8gb-vram
 
 Usar python 3.12.3 ou anterior
+Drivers CUDA da NVIDA para rodar pytorch usando a GPU
 
 # Cria enviromment
 python -m venv venv
