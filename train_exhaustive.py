@@ -169,6 +169,7 @@ def main():
         num_train_epochs=15000, # INCREASED TO 15000 (~1 hour)
         logging_steps=50,
         save_steps=200, 
+        save_total_limit=1, # Save only the last checkpoint ~400MB
         fp16=False,
         dataloader_num_workers=0
     )
