@@ -1,4 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu129
+
 torch
+torchaudio
 transformers
 datasets
 accelerate
@@ -6,3 +9,5 @@ soundfile
 librosa
 speechbrain
 sentencepiece
+peft
+numpy<2.0.0

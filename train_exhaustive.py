@@ -1,4 +1,7 @@
 import os
+import sys
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
 import torch
 import torchaudio
 import unicodedata
@@ -174,7 +177,7 @@ def main():
         dataloader_num_workers=0
     )
 
-    trainer = Trainer(model=model, args=training_args, train_dataset=dataset, data_collator=data_collator, tokenizer=processor.feature_extractor)
+    trainer = Trainer(model=model, args=training_args, train_dataset=dataset, data_collator=data_collator, processing_class=processor.feature_extractor)
     
     print("\n🔥 Treinando Exaustivamente (1000 Epochs, BS=8)...")
     trainer.train()

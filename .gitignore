@@ -4,6 +4,7 @@ __pycache__/
 
 # Virtual Environment
 venv/
+.venv/
 
 # Environment Variables
 .env
@@ -15,3 +16,6 @@ speecht5_laps_lora_exhaustive/
 # Editor
 .vscode/
 .idea/
+
+# Ffmpeg   
+ffmpeg/
