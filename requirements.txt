@@ -13,7 +13,7 @@ cffi==2.0.0
 charset-normalizer==3.4.6
 click==8.3.1
 colorama==0.4.6
-datasets==2.19.0
+datasets==3.1.0
 decorator==5.2.1
 dill==0.3.8
 filelock==3.25.2
@@ -40,7 +40,7 @@ multidict==6.7.1
 multiprocess==0.70.16
 networkx==3.6.1
 numba==0.64.0
-numpy==1.26.4
+numpy==2.4.4
 packaging==26.0
 pandas==3.0.1
 peft==0.18.1
