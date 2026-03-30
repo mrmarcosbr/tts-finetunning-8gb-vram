@@ -1,14 +1,16 @@
 import os
 
+from apply_patches_no_warnings import get_venv_path
+
 """
 Este patch trata a seguinte mensagem de Warning:
 UserWarning: torchaudio._backend.list_audio_backends has been deprecated. This deprecation is part of a large refactoring effort...
 O core do SpeechBrain usava lógica de backend agora legada para listar extensões instaladas. O patch bypassa essa checagem desatualizada para evitar o Warning nas bibliotecas C++ da HuggingFace/PyTorch.
 """
 
-def apply_patch():
+def apply_patch(venv_dir):
     # Atualiza o arquivo speechbrain/utils/torch_audio_backend.py
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Lib", "site-packages", "speechbrain", "utils", "torch_audio_backend.py")
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), venv_dir, "Lib", "site-packages", "speechbrain", "utils", "torch_audio_backend.py")
     if not os.path.exists(file_path):
         print(f"[{__file__}] Arquivo {file_path} não encontrado. Patch pulado.")
         return
@@ -41,4 +43,5 @@ def apply_patch():
         print("Aviso: patch_torchaudio pulado (já aplicado ou alvo não encontrado).")
 
 if __name__ == "__main__":
-    apply_patch()
+    venv_dir = get_venv_path()
+    apply_patch(venv_dir)

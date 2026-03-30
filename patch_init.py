@@ -1,5 +1,7 @@
 import os
 
+from apply_patches_no_warnings import get_venv_path
+
 """
 Este patch trata a seguinte mensagem de Warning:
 UserWarning: Module 'speechbrain.pretrained' was deprecated, redirecting to 'speechbrain.inference'.
@@ -8,8 +10,8 @@ sempre que as rotinas do 'transformers' inspecionavam os módulos carregados.
 Desativando essa rotina nós economizamos falsos positivos na suíte de log.
 """
 
-def apply_patch():
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Lib", "site-packages", "speechbrain", "__init__.py")
+def apply_patch(venv_dir):
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), venv_dir, "Lib", "site-packages", "speechbrain", "__init__.py")
     if not os.path.exists(file_path):
         print(f"[{__file__}] Arquivo {file_path} não encontrado. Patch pulado.")
         return
@@ -31,4 +33,5 @@ def apply_patch():
         print("Aviso: patch_init pulado (já aplicado ou alvo não encontrado).")
 
 if __name__ == "__main__":
-    apply_patch()
+    venv_dir = get_venv_path()
+    apply_patch(venv_dir)

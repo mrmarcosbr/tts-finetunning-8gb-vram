@@ -1,13 +1,16 @@
 import os
 
+from apply_patches_no_warnings import get_venv_path
+
 """
 Este patch trata a seguinte mensagem de Warning:
 FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
 A nova versão do decorador exige parâmetros contextuais baseados no dispositivo em vez do fallback antigo de GPU impositivo.
 """
 
-def apply_patch():
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Lib", "site-packages", "speechbrain", "utils", "autocast.py")
+def apply_patch(venv_dir):
+    
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), venv_dir, "Lib", "site-packages", "speechbrain", "utils", "autocast.py")
     if not os.path.exists(file_path):
         print(f"[{__file__}] Arquivo {file_path} não encontrado. Patch pulado.")
         return
@@ -29,5 +32,8 @@ def apply_patch():
     else:
         print("Aviso: patch_autocast pulado (já aplicado ou alvo não encontrado).")
 
+
 if __name__ == "__main__":
-    apply_patch()
+    venv_dir = get_venv_path()
+    apply_patch(venv_dir)
+
