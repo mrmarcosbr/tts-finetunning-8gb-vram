@@ -7,8 +7,7 @@ import torchaudio
 import unicodedata
 
 # --- 1. Monkey Patch & Setup ---
-if not hasattr(torchaudio, "list_audio_backends"):
-    torchaudio.list_audio_backends = lambda: ["soundfile"]
+# (Monkey patch removido - backend ajustado nativamente)
 
 from datasets import load_dataset, Audio, Dataset
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan
@@ -92,7 +91,7 @@ def main():
     # --- 4. Speaker Embeddings ---
     print("Carregando Speaker Encoder...")
     spk_model_name = "speechbrain/spkrec-xvect-voxceleb"
-    speaker_model = EncoderClassifier.from_hparams(source=spk_model_name, run_opts={"device": device}, savedir=os.path.join("/tmp", spk_model_name))
+    speaker_model = EncoderClassifier.from_hparams(source=spk_model_name, run_opts={"device": device})
 
     def create_speaker_embedding(waveform):
         with torch.no_grad():
@@ -149,12 +148,14 @@ def main():
                 padded_labels.append(torch.nn.functional.pad(l, (0, 0, 0, pad_len), value=-5.0))
             
             batch["labels"] = torch.stack(padded_labels)
-            batch["speaker_embeddings"] = torch.stack([torch.tensor(s) for s in speaker_features])
+            batch["speaker_embeddings"] = torch.stack([s.clone().detach() if isinstance(s, torch.Tensor) else torch.tensor(s) for s in speaker_features])
             return batch
 
     data_collator = TTSDataCollatorWithPadding(processor=processor)
 
     # --- 7. Model (V12 Base: Rank 32) ---
+    # Ignorar as chaves de posições que o checkpoint original do HuggingFace deixou no arquivo mas que não usamos
+    SpeechT5ForTextToSpeech._keys_to_ignore_on_load_unexpected = [r'.*encode_positions\.pe']
     model = SpeechT5ForTextToSpeech.from_pretrained(model_id)
     
     # MAXIMUM Rank (256) for aggressive VRAM usage and overfitting

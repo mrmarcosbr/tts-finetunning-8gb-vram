@@ -1,6 +1,6 @@
 # tts-finetunning-8gb-vram
 
-- Usar python 3.12.3 ou anterior
+- Testado com python 3.11.9 (Windows) e 3.12.3 (Linux)
 - Drivers CUDA da NVIDA para rodar pytorch usando a GPU
 
 # Cria enviromment
@@ -9,6 +9,10 @@
 
 # Instala dependências
 - pip install -r requirements.txt
+
+# Aplicar Patches e Correções Nativas (Recomendado)
+Algumas bibliotecas como SpeechBrain e HuggingFace podem apresentar alertas conflitantes (ex: warnings do `autocast`, bugs de `HF_TOKEN` suprimido e erros falsos 404 HTTP). Para ter um ambiente de console limpo e livre de interrupções falsas, execute os scripts de correção que injetam os reparos diretamente na sua subpasta `.venv` recém instalada:
+- python apply_patches_no_warnings.py
 
 # Treina Modelo (Fine Tunning)
 - python train_exhaustive.py

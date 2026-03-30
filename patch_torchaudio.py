@@ -1,0 +1,44 @@
+import os
+
+"""
+Este patch trata a seguinte mensagem de Warning:
+UserWarning: torchaudio._backend.list_audio_backends has been deprecated. This deprecation is part of a large refactoring effort...
+O core do SpeechBrain usava lógica de backend agora legada para listar extensões instaladas. O patch bypassa essa checagem desatualizada para evitar o Warning nas bibliotecas C++ da HuggingFace/PyTorch.
+"""
+
+def apply_patch():
+    # Atualiza o arquivo speechbrain/utils/torch_audio_backend.py
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Lib", "site-packages", "speechbrain", "utils", "torch_audio_backend.py")
+    if not os.path.exists(file_path):
+        print(f"[{__file__}] Arquivo {file_path} não encontrado. Patch pulado.")
+        return
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    target = """    elif torchaudio_major >= 2 and torchaudio_minor >= 1:
+        available_backends = torchaudio.list_audio_backends()
+
+        if len(available_backends) == 0:"""
+
+    replacement = """    elif torchaudio_major >= 2 and torchaudio_minor >= 1:
+        # FIX: Avoid deprecated torchaudio.list_audio_backends() to prevent UserWarning
+        available_backends = []
+        try:
+            import soundfile
+            available_backends.append("soundfile")
+        except ImportError:
+            pass
+
+        if len(available_backends) == 0:"""
+
+    if target in content and replacement not in content:
+        content = content.replace(target, replacement)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print("Sucesso: patch_torchaudio (audio backend lib) aplicado.")
+    else:
+        print("Aviso: patch_torchaudio pulado (já aplicado ou alvo não encontrado).")
+
+if __name__ == "__main__":
+    apply_patch()
