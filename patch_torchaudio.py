@@ -1,6 +1,6 @@
 import os
 
-from apply_patches_no_warnings import get_venv_path
+from apply_patches_no_warnings import get_venv_path, get_package_file_path
 
 """
 Este patch trata a seguinte mensagem de Warning:
@@ -10,9 +10,9 @@ O core do SpeechBrain usava lógica de backend agora legada para listar extensõ
 
 def apply_patch(venv_dir):
     # Atualiza o arquivo speechbrain/utils/torch_audio_backend.py
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), venv_dir, "Lib", "site-packages", "speechbrain", "utils", "torch_audio_backend.py")
-    if not os.path.exists(file_path):
-        print(f"[{__file__}] Arquivo {file_path} não encontrado. Patch pulado.")
+    file_path = get_package_file_path("speechbrain", "utils/torch_audio_backend.py", venv_dir)
+    if not file_path or not os.path.exists(file_path):
+        print(f"[{os.path.basename(__file__)}] Arquivo não encontrado (speechbrain/utils/torch_audio_backend.py). Patch pulado.")
         return
 
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -44,4 +44,7 @@ def apply_patch(venv_dir):
 
 if __name__ == "__main__":
     venv_dir = get_venv_path()
-    apply_patch(venv_dir)
+    if venv_dir:
+        apply_patch(venv_dir)
+    else:
+        print(f"[{os.path.basename(__file__)}] Erro: Ambiente virtual não encontrado.")
