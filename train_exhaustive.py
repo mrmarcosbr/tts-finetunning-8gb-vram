@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 import yaml
 import torch
 import torchaudio
@@ -16,6 +17,8 @@ from datasets import load_dataset, Audio, Dataset
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
+
+fine_tuning_model_name = "SpeechT5"
 
 # Configuração de encoding para Windows
 if sys.stdout.encoding.lower() != 'utf-8':
@@ -84,7 +87,17 @@ def main():
         profile_name = "cpu"
     
     profile_cfg = full_cfg['profiles'][profile_name]
+    
+    # Criar subpasta com timestamp para o novo treinamento
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    model_folder = f"{fine_tuning_model_name}-{timestamp}"
+    profile_cfg['output_dir'] = os.path.join(profile_cfg['output_dir'], model_folder)
+    
+    # Garantir que o diretório exista
+    os.makedirs(profile_cfg['output_dir'], exist_ok=True)
+
     print(f"🚀 Perfil Ativo: {profile_name.upper()}")
+    print(f"📁 Pasta de Saída do Modelo: {profile_cfg['output_dir']}")
 
     # 4. Setup do Hardware
     device = profile_cfg.get('device', "cuda" if torch.cuda.is_available() else "cpu")
