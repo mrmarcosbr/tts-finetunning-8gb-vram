@@ -1,0 +1,54 @@
+# Configurações Globais (Comuns a todos os perfis)
+model:
+  id: "microsoft/speecht5_tts"
+  vocoder_id: "microsoft/speecht5_hifigan"
+  speaker_encoder_id: "speechbrain/spkrec-xvect-voxceleb"
+
+dataset:
+  id: "falabrasil/lapsbm"
+  split: "test"
+  num_speakers: 1 # 0 para todos
+
+lora:
+  r: 256
+  alpha: 512
+  dropout: 0.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+
+# Perfis de Hardware
+profiles:
+  cpu:
+    device: "cpu"
+    batch_size: 1
+    fp16: false
+    gradient_accumulation_steps: 8
+    output_dir: "./output_cpu"
+
+  cuda_8gb:
+    device: "cuda"
+    batch_size: 4
+    fp16: true # Crucial para economizar VRAM
+    gradient_accumulation_steps: 4 # Total batch virtual = 16
+    output_dir: "./output_cuda_8gb"
+
+  cuda_16gb:
+    device: "cuda"
+    batch_size: 16
+    fp16: true
+    gradient_accumulation_steps: 1
+    output_dir: "./output_cuda_16gb"
+
+  macbook:
+    device: "mps" # Metal Performance Shaders para Apple Silicon
+    batch_size: 2
+    fp16: false # MPS ainda tem instabilidades com fp16 em alguns ops de TTS
+    gradient_accumulation_steps: 4
+    output_dir: "./output_mac"
+
+# Parâmetros gerais de treino (podem ser sobrescritos nos perfis se desejar)
+training:
+  learning_rate: 0.00001
+  num_epochs: 15000
+  weight_decay: 0.0
+  save_steps: 200
+  logging_steps: 50
