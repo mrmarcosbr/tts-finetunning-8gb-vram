@@ -4,14 +4,23 @@ __pycache__/
 
 # Virtual Environment
 venv/
+.venv/
 
 # Environment Variables
 .env
 
 # Checkpoints / Output
 speecht5_laps_lora_exhaustive/
+output_cuda_16gb/
+output_cuda_8gb/
+output_cpu/
+output_mac/
 #*.wav
 
 # Editor
 .vscode/
 .idea/
+
+# Ffmpeg   
+ffmpeg/
+
