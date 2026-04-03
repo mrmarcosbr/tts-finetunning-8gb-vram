@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -449,6 +450,8 @@ def main():
 
     print(f"🚀 Iniciando Pipeline para: {model_type.upper()}")
     print(f"📂 Dataset: {dataset_name} | Hardware: {hw_profile.upper()}")
+    
+    start_time = time.time()
 
     # 4. Handler e Carregamento do Modelo
     handler = get_handler(model_type, model_cfg, device)
@@ -601,6 +604,45 @@ def main():
     except Exception as e:
         print(f"⚠️ Atenção ao salvar modelo final: {e}")
         print("💡 Nota: Os checkpoints do treinamento (ex: checkpoint-3000) já foram salvos automaticamente pelo Trainer e podem ser utilizados!")
+
+    # 9. Saving Cost-Benefit Metrics
+    print("\n📝 Gerando README com parâmetros da fórmula Custo-Benefício...")
+    end_time = time.time()
+    training_latency = end_time - start_time
+    
+    final_loss = None
+    if trainer.state.log_history:
+        for log in reversed(trainer.state.log_history):
+            if 'loss' in log:
+                final_loss = log['loss']
+                break
+                
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    vram_allocated_gb = torch.cuda.max_memory_allocated(0) / (1024**3) if torch.cuda.is_available() else 0.0
+    
+    readme_appendix = f"""
+---
+## Parâmetros da Fórmula Custo-Benefício (Treinamento)
+
+**Fórmula Original:**
+`CustoBeneficio = [w1 * (1 - WER) + w2 * SimLocutor + w3 * Qualidade] / [CustoGPU$ + lambda * Latência]`
+
+### 🔻 Custos (Denominador)
+- **CustoGPU$ (Hardware + Uso VRAM)**: {gpu_name} (Pico VRAM: {vram_allocated_gb:.2f} GB)
+- **Latência (Tempo de Treinamento)**: {training_latency:.2f} segundos ({training_latency/60:.2f} minutos)
+
+### 🌟 Benefícios (Numerador - Proxies Atuais)
+*Métricas como WER, Similaridade e MOS (Qualidade) requerem uma etapa de `inferência + validação` ao final do processo. Aqui usamos a Loss do treino como indicativo de melhora na capacidade do modelo.*
+- **Loss Final do Treino**: {final_loss if final_loss is not None else 'N/A'}
+"""
+    readme_path = os.path.join(out_dir, "README.md")
+    mode = "a" if os.path.exists(readme_path) else "w"
+    try:
+        with open(readme_path, mode, encoding="utf-8") as f:
+            f.write(readme_appendix)
+        print(f"📄 Parâmetros de Custo-Benefício adicionados ao README em: {readme_path}")
+    except Exception as e:
+        print(f"⚠️ Erro ao atualizar README: {e}")
 
 if __name__ == "__main__":
     main()

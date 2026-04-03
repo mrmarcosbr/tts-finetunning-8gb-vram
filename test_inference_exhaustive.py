@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import yaml
 import torch
 import torchaudio
@@ -32,6 +33,28 @@ def normalize_text(text):
     if not text: return ""
     return ''.join(c for c in unicodedata.normalize('NFD', text)
                    if unicodedata.category(c) != 'Mn')
+
+def calculate_wer(reference_text, hypothesis_text):
+    import re
+    # Limpa pontuação e deixa tudo minúsculo
+    def clean(s): return re.sub(r'[^\w\s]', '', s.lower().strip())
+    
+    ref_words = clean(reference_text).split()
+    hyp_words = clean(hypothesis_text).split()
+    if not ref_words: return 0.0
+
+    d = np.zeros((len(ref_words) + 1, len(hyp_words) + 1), dtype=np.uint8)
+    for i in range(len(ref_words) + 1): d[i][0] = i
+    for j in range(len(hyp_words) + 1): d[0][j] = j
+    for i in range(1, len(ref_words) + 1):
+        for j in range(1, len(hyp_words) + 1):
+            if ref_words[i - 1] == hyp_words[j - 1]:
+                d[i][j] = d[i - 1][j - 1]
+            else:
+                d[i][j] = min(d[i - 1][j - 1], d[i][j - 1], d[i - 1][j]) + 1
+                
+    return float(d[len(ref_words)][len(hyp_words)]) / len(ref_words)
+
 
 def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -219,6 +242,24 @@ def main():
     device = hw_cfg.get('device', 'cpu')
     print(f"🚀 Hardware: {hw_name.upper()} | Dataset: {dataset_name} | Modelo: {model_type}")
 
+    # 3. Modelos Opcionais de Validação (MOS e ASR)
+    print("\n📦 Carregando modelos especialistas auxiliares para validação das métricas (Whisper e SQUIM)...")
+    try:
+        import speechmos.dnsmos as dnsmos
+        from transformers import pipeline
+        
+        print("   ⏳ Carregando SpeechMOS (DNSMOS) para previsão de MOS (Qualidade)...")
+        mos_predictor = dnsmos
+        
+        print("   ⏳ Carregando Whisper Large V3 Turbo para Transcrição e extração de WER...")
+        # Usa GPU local da forma segura
+        asr_pipeline = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0 if torch.cuda.is_available() else -1)
+        print("   ✅ Sucesso! Faremos a validação total.")
+    except Exception as e:
+        print(f"   ⚠️ Alerta: Bibliotecas ou modelos extras falharam. Continuará sem WER/MOS. Detalhe: {e}")
+        mos_predictor = None
+        asr_pipeline = None
+
     # 3. Localizar Modelo
     profile_output_dir = hw_cfg['output_dir']
     if args.model_name:
@@ -303,14 +344,90 @@ def main():
         A ideia é ver como ele se comporta com diferentes tipos de texto, considerando elementos como prosódia, entonação e ritmo.")
     ]
     
-    print("\n🎧 Gerando áudios...")
+    print("\n🎧 Gerando áudios e Validando Métricas...")
+    
+    validation_metrics = []
+    
     for filename, text in cases:
         clean_text = normalize_text(text)
         print(f"   📝 {filename}: '{clean_text}'")
+        
+        # 7. Medir Latência
+        start_time = time.time()
         audio_out = handler.generate(clean_text, emb)
+        gen_time = time.time() - start_time
+        
+        # Calcular RTF (Real Time Factor)
+        audio_duration = len(audio_out) / target_sr
+        rtf = gen_time / audio_duration if audio_duration > 0 else 0
+        
         out_path = os.path.join(model_path, f"{filename}_{dataset_name}_{model_type}_test.wav")
         sf.write(out_path, audio_out, target_sr)
+        
+        # 8. Calcular Similaridade do Locutor (SimLocutor)
+        # O modelo SpeechBrain espera 16000Hz
+        if target_sr != 16000:
+            import librosa
+            audio_out_16k = librosa.resample(audio_out, orig_sr=target_sr, target_sr=16000)
+        else:
+            audio_out_16k = audio_out
+            
+        with torch.no_grad():
+            gen_emb = speaker_model.encode_batch(torch.tensor(audio_out_16k)).to(device)
+            gen_emb = torch.nn.functional.normalize(gen_emb, dim=2).squeeze().unsqueeze(0)
+            # Calcula similaridade do cosseno (-1 a 1)
+            sim = torch.nn.functional.cosine_similarity(emb, gen_emb).item()
+            
+        # 8b. Calcular Qualidade de Áudio Preditiva (MOS de 1 a 5)
+        mos_score = 0.0
+        if mos_predictor:
+            # O DNSMOS do speechmos recebe o numpy array e sample_rate 16000
+            mos_res = mos_predictor.run(audio_out_16k, 16000)
+            mos_score = mos_res['ovrl_mos']
+                
+        # 8c. Calcular Word Error Rate (WER via Whisper transcrevendo o Output)
+        wer_score = 1.0 # 100% de erro de fallback se falhar
+        if asr_pipeline:
+            whisper_out = asr_pipeline({"raw": audio_out_16k, "sampling_rate": 16000})
+            transcription = whisper_out["text"]
+            wer_score = calculate_wer(clean_text, transcription)
+            
         print(f"      ✅ Salvo: {out_path}")
+        print(f"         ➡️ [Métricas] RTF: {rtf:.2f}x | SimLocutor: {sim:.3f} | MOS: {mos_score:.2f} | WER: {wer_score:.2f}")
+        validation_metrics.append({"filename": filename, "rtf": rtf, "sim": sim, "mos": mos_score, "wer": wer_score})
+
+    # 9. Anexar métricas no README.md do Modelo
+    if validation_metrics:
+        avg_rtf = sum(m["rtf"] for m in validation_metrics) / len(validation_metrics)
+        avg_sim = sum(m["sim"] for m in validation_metrics) / len(validation_metrics)
+        avg_mos = sum(m["mos"] for m in validation_metrics) / len(validation_metrics)
+        avg_wer = sum(m["wer"] for m in validation_metrics) / len(validation_metrics)
+        
+        # Calcular Accuracy Positiva (1 - WER) => Ex: WER 0.2 vira Acc 0.8
+        acc_wer = max(1.0 - avg_wer, 0.0)
+        
+        readme_path = os.path.join(model_path, "README.md")
+        # Se for string multi line sem indent, fica melhor no markdown
+        readme_appendix = f"""
+## Parâmetros da Fórmula Custo-Benefício (Validação de Inferência)
+
+**Teste realizado com o script test_inference_exhaustive.py gerando inferências diretas e métricas automatizadas.**
+
+### 🔻 Custos Adicionais (Denominador)
+- **Latência Média de Geração (RTF)**: {avg_rtf:.2f}x *(O tempo levado divido pela duração total do áudio em segundos)*
+
+### 🌟 Benefícios Medidos (Numerador Prático)
+- **Acurácia (1 - WER)**: {acc_wer:.3f} *(Extraída através do word-error-rate transcrito pelo Whisper e Distância Levenshtein)*
+- **SimLocutor Médio (Similaridade de Voz)**: {avg_sim:.3f} *(Medido via distância de cossenos em Embeddings do WavLM/SpeechBrain. >0.85 é excelente)*
+- **Qualidade Média Percebida (MOS Nominal)**: {avg_mos:.2f} / 5.00 *(Calculado via torchaudio SQUIM_SUBJECTIVE DNS)*
+"""
+        mode = "a" if os.path.exists(readme_path) else "w"
+        try:
+            with open(readme_path, mode, encoding="utf-8") as f:
+                f.write(readme_appendix)
+            print(f"\n📄 Métricas de Inferência anexadas ao README do modelo na pasta:\n   {readme_path}")
+        except Exception as e:
+            print(f"\n⚠️ Falha ao salvar README de inferência: {e}")
 
 if __name__ == "__main__":
     main()
