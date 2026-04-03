@@ -298,8 +298,8 @@ def main():
     cases = [
         ("caso1_standard", "O treinamento foi finalizado e agora estamos testando a voz em português."),
         ("caso2_paris", "Há algumas coisas que não podem deixar de serem vistas em Paris."),
-        ("caso3_extra", f"Olá! Tudo bem com você?? Eu estou ótimo!!!!! 
-        Estamos testando o suporte multi-modelo para {model_type.upper()}. 
+        (f"caso3_extra", f"Olá! Tudo bem com você?? Eu estou ótimo!!!!! \
+        Estamos testando o suporte multi-modelo para {model_type.upper()}. \
         A ideia é ver como ele se comporta com diferentes tipos de texto, considerando elementos como prosódia, entonação e ritmo.")
     ]
     
