@@ -1,22 +1,12 @@
-# Configurações Globais (Comuns a todos os perfis)
-model:
-  id: "microsoft/speecht5_tts"
-  vocoder_id: "microsoft/speecht5_hifigan"
-  speaker_encoder_id: "speechbrain/spkrec-xvect-voxceleb"
+# CONFIGURAÇÕES GERAIS
+# ==============================================================================
+settings:
+  default_dataset_profile: "lapsbm_speecht5"
 
-dataset:
-  id: "falabrasil/lapsbm"
-  split: "test"
-  num_speakers: 1 # 0 para todos
-
-lora:
-  r: 256
-  alpha: 512
-  dropout: 0.0
-  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
-
-# Perfis de Hardware
-profiles:
+# ==============================================================================
+# PERFIS DE HARDWARE (Processamento e Otimização de Memória)
+# ==============================================================================
+hardware_profiles:
   cpu:
     device: "cpu"
     batch_size: 1
@@ -45,10 +35,148 @@ profiles:
     gradient_accumulation_steps: 4
     output_dir: "./output_mac"
 
-# Parâmetros gerais de treino (podem ser sobrescritos nos perfis se desejar)
-training:
-  learning_rate: 0.00001
-  num_epochs: 15000
-  weight_decay: 0.0
-  save_steps: 200
-  logging_steps: 50
+# ==============================================================================
+# CONFIGURAÇÕES DE MODELOS BASE
+# ==============================================================================
+models:
+  speecht5:
+    id: "microsoft/speecht5_tts"
+    sampling_rate: 16000
+    vocoder_id: "microsoft/speecht5_hifigan"
+    speaker_encoder_id: "speechbrain/spkrec-xvect-voxceleb"
+    lora:
+      r: 256
+      alpha: 512
+      dropout: 0.0
+      target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+
+  xtts_v2:
+    id: "coqui/XTTS-v2"
+    sampling_rate: 24000
+    lora:
+      r: 8
+      alpha: 16
+      dropout: 0.05
+      target_modules: ["c_attn", "c_proj"]
+
+  f5_tts:
+    id: "lucidrains/f5-tts" # Requer implementação externa ou biblioteca f5-tts
+    sampling_rate: 24000
+    lora:
+      r: 16
+      alpha: 32
+      dropout: 0.1
+      target_modules: ["to_q", "to_v"]
+
+  fish_speech:
+    id: "fishaudio/fish-speech-1.5"
+    sampling_rate: 48000
+    lora:
+      r: 8
+      alpha: 16
+      dropout: 0.1
+      target_modules: ["q_proj", "v_proj"]
+
+  your_tts:
+    id: "cshulby/YourTTS" # Coqui YourTTS
+    sampling_rate: 16000
+    lora:
+      r: 32
+      alpha: 64
+      dropout: 0.1
+      target_modules: ["encoder.attn.q", "encoder.attn.v"]
+
+  toucan_tts:
+    id: "Flux9665/ToucanTTS" # IMS Toucan
+    sampling_rate: 24000
+    lora:
+      r: 32
+      alpha: 64
+      dropout: 0.1
+      target_modules: ["attention.linear_q", "attention.linear_v"]
+
+# ==============================================================================
+# PERFIS DE DATASET (Configurações específicas por Treinamento)
+# A cada novo dataset solicitado, criaremos um novo profile aqui.
+# ==============================================================================
+dataset_profiles:
+  # Perfil padrão para o dataset LapsBM (FalaBrasil)
+  lapsbm_speecht5:
+    dataset_id: "falabrasil/lapsbm"
+    dataset_split: "test"
+    model_type: "speecht5"
+    num_speakers: 0 # 0 para todos
+    num_samples_per_speaker: 10000 # Limite balizador
+    training:
+      learning_rate: 0.00001
+      num_epochs: 2500
+      weight_decay: 0.0
+      save_steps: 200
+      logging_steps: 50
+
+  lapsbm_f5_tts:
+    dataset_id: "falabrasil/lapsbm"
+    dataset_split: "test"
+    model_type: "f5_tts"
+    num_speakers: 1 # 0 para todos
+    num_samples_per_speaker: 100 # Limite balizador
+    training:
+      learning_rate: 0.00005 # Levemente ajustado para compensar menos épocas
+      num_epochs: 3000 # DiTs convergem com menos épocas comparado a Encoders simples (reduz tempo drasticamente)
+      weight_decay: 0.0
+      save_steps: 500 # Salvamentos menos agressivos
+      logging_steps: 100
+
+  lapsbm_xtts_v2:
+    dataset_id: "falabrasil/lapsbm"
+    dataset_split: "test"
+    model_type: "xtts_v2"
+    num_speakers: 1 # 0 para todos
+    training:
+      learning_rate: 0.00001
+      num_epochs: 15000
+      weight_decay: 0.0
+      save_steps: 200
+      logging_steps: 50
+
+  # Perfil para dataset derivado do Common Voice - pt-br_char
+  pt_br_char_speecht5:
+    dataset_id: "firstpixel/pt-br_char"
+    dataset_split: "train"
+    model_type: "speecht5"
+    num_speakers: 1 # 0 para todos
+    num_samples_per_speaker: 100 # Limite de captação de amostras por voz
+    training:
+      learning_rate: 0.00002
+      num_epochs: 1000
+      weight_decay: 0.01
+      save_steps: 500
+      logging_steps: 100
+
+  pt_br_char_f5_tts:
+    dataset_id: "firstpixel/pt-br_char"
+    dataset_split: "train"
+    model_type: "f5_tts"
+    num_speakers: 1 # 0 para todos
+    num_samples_per_speaker: 100 # Reduz memória/Tempo no DiT
+    training:
+      learning_rate: 0.00005
+      num_epochs: 15 # Teste de poucos minutos
+      weight_decay: 0.0
+      save_steps: 500
+      logging_steps: 1
+
+  # Perfil para o BRSpeech-DF (Deepfake Detection/Voice Samples) - NÃO USAR pois não tem Transcrições
+  # Nota: Este dataset foca em detecção, vozes reais no subset 'bonafide'
+  brspeech_df:
+    dataset_id: "AKCIT-Deepfake/BRSpeech-DF"
+    dataset_split: "train"
+    dataset_config: "bonafide" # Subset com vozes reais para clonagem/finetuning
+    model_type: "speecht5"
+    num_speakers: 1
+    training:
+      learning_rate: 0.00001
+      num_epochs: 5000
+      weight_decay: 0.01
+      save_steps: 1000
+      logging_steps: 100

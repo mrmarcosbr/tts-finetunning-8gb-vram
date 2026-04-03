@@ -18,6 +18,15 @@
 Algumas bibliotecas como SpeechBrain e HuggingFace podem apresentar erros e alertas conflitantes (ex: warnings do `autocast`, bugs de `HF_TOKEN` suprimido e erros falsos 404 HTTP). Para ter um ambiente de console limpo e livre de interrupções falsas, execute os scripts de correção que injetam os reparos diretamente na sua subpasta `venv` recém instalada (somente depois de já ter instalado os pacotes com pip install):
 - python apply_patches_no_warnings.py
 
+# Trabalhando com Datasets Offline (Opcional)
+Se você deseja garantir os gigantescos arquivos de áudio protegidos na sua máquina de forma permanente e sem depender da internet no momento do treinamento (ou pra se proteger caso deletem a base pública original da HuggingFace), os componentes do repositório contam com "interceptação automática offline".
+
+Para clonar e preservar os arquivos de áudio originais (ex: LapsBM, Pt-BR Char), basta rodar nosso utilitário na raiz do projeto:
+- `python download_datasets.py --repo falabrasil/lapsbm`
+- Ou `python download_datasets.py --all` (para realizar o espelhamento de todos os da nossa grade simultaneamente).
+
+Isso formará a pasta `/meus_datasets/`. Sempre que você rodar os testes de Inferência ou Treinamento a partir de agora, eles utilizarão primariamente e prioritariamente a leitura nativa isolada nos seus discos rígidos onde a internet se torna irrelevante.
+
 # Configuração do Treinamento/Fine-Tuning
 Verificar o arquivo config.yaml que contem as configurações de treinamento para cada profile (ex: "cuda_16gb", "macbook", "cpu").
 - config.yaml
