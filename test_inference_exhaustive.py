@@ -1,5 +1,7 @@
 import os
 import sys
+sys.modules['torchcodec'] = None # Mock para evitar crash do torchaudio e do transformers no Windows
+
 import time
 import yaml
 import torch
@@ -244,21 +246,25 @@ def main():
 
     # 3. Modelos Opcionais de Validação (MOS e ASR)
     print("\n📦 Carregando modelos especialistas auxiliares para validação das métricas (Whisper e SQUIM)...")
+    
+    mos_predictor = None
     try:
         import speechmos.dnsmos as dnsmos
-        from transformers import pipeline
-        
         print("   ⏳ Carregando SpeechMOS (DNSMOS) para previsão de MOS (Qualidade)...")
         mos_predictor = dnsmos
-        
+        print("   ✅ SpeechMOS carregado com sucesso.")
+    except Exception as e:
+        print(f"   ⚠️ Alerta: Falha ao carregar SpeechMOS (DNSMOS). Continuará sem MOS. Detalhe: {e}")
+
+    asr_pipeline = None
+    try:
+        from transformers import pipeline
         print("   ⏳ Carregando Whisper Large V3 Turbo para Transcrição e extração de WER...")
         # Usa GPU local da forma segura
-        asr_pipeline = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0 if torch.cuda.is_available() else -1)
-        print("   ✅ Sucesso! Faremos a validação total.")
+        asr_pipeline = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0 if torch.cuda.is_available() else -1, chunk_length_s=30)
+        print("   ✅ Whisper carregado com sucesso.")
     except Exception as e:
-        print(f"   ⚠️ Alerta: Bibliotecas ou modelos extras falharam. Continuará sem WER/MOS. Detalhe: {e}")
-        mos_predictor = None
-        asr_pipeline = None
+        print(f"   ⚠️ Alerta: Falha ao carregar Whisper. Continuará sem WER. Detalhe: {e}")
 
     # 3. Localizar Modelo
     profile_output_dir = hw_cfg['output_dir']
