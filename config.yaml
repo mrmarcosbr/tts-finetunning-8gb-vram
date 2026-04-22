@@ -107,6 +107,10 @@ dataset_profiles:
     model_type: "speecht5"
     num_speakers: 0 # 0 para todos
     num_samples_per_speaker: 10000 # Limite balizador
+    zero_shot_split:
+      train_speakers: 28
+      val_speakers: 3
+      test_speakers: 4
     training:
       learning_rate: 0.00001
       num_epochs: 2500
@@ -118,8 +122,12 @@ dataset_profiles:
     dataset_id: "falabrasil/lapsbm"
     dataset_split: "test"
     model_type: "f5_tts"
-    num_speakers: 1 # 0 para todos
+    num_speakers: 0 # 0 para todos
     num_samples_per_speaker: 100 # Limite balizador
+    zero_shot_split:
+      train_speakers: 28
+      val_speakers: 3
+      test_speakers: 4
     training:
       learning_rate: 0.00005 # Levemente ajustado para compensar menos épocas
       num_epochs: 3000 # DiTs convergem com menos épocas comparado a Encoders simples (reduz tempo drasticamente)
@@ -131,7 +139,11 @@ dataset_profiles:
     dataset_id: "falabrasil/lapsbm"
     dataset_split: "test"
     model_type: "xtts_v2"
-    num_speakers: 1 # 0 para todos
+    num_speakers: 0 # 0 para todos
+    zero_shot_split:
+      train_speakers: 28
+      val_speakers: 3
+      test_speakers: 4
     training:
       learning_rate: 0.00001
       num_epochs: 15000

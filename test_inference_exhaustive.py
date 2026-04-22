@@ -242,6 +242,7 @@ def main():
     hw_name = args.profile or detect_hardware_profile()
     hw_cfg = full_cfg['hardware_profiles'].get(hw_name, full_cfg['hardware_profiles']['cpu'])
     device = hw_cfg.get('device', 'cpu')
+    
     print(f"🚀 Hardware: {hw_name.upper()} | Dataset: {dataset_name} | Modelo: {model_type}")
 
     # 3. Modelos Opcionais de Validação (MOS e ASR)
@@ -268,24 +269,58 @@ def main():
 
     # 3. Localizar Modelo
     profile_output_dir = hw_cfg['output_dir']
+    model_path = None
+
     if args.model_name:
-        model_path = os.path.join(profile_output_dir, args.model_name)
+        # Tenta no diretório do perfil atual
+        temp_path = os.path.join(profile_output_dir, args.model_name)
+        if os.path.exists(temp_path):
+            model_path = temp_path
+        else:
+            # Busca em outros diretórios de perfis caso tenha mudado de hardware (ex: CUDA -> CPU fallback)
+            for p_name, p_cfg in full_cfg['hardware_profiles'].items():
+                alt_path = os.path.join(p_cfg['output_dir'], args.model_name)
+                if os.path.exists(alt_path):
+                    model_path = alt_path
+                    print(f"📂 Modelo encontrado em diretório alternativo: {alt_path}")
+                    break
+        
+        if not model_path:
+            print(f"❌ Erro: O diretório do modelo '{args.model_name}' não foi encontrado em nenhum perfil de saída.")
+            sys.exit(1)
     else:
+        # Lógica de detecção automática baseada no prefixo
         prefix = f"{model_type}-{dataset_name}-"
-        subfolders = [f for f in os.listdir(profile_output_dir) if os.path.isdir(os.path.join(profile_output_dir, f)) and prefix in f]
-        if not subfolders:
-             print(f"⚠️ Nenhum modelo encontrado contendo '{prefix}'. Buscando falback...")
-             fallback_path = os.path.join(profile_output_dir, "0-1-Locutor-speecht5_laps_lora_exhaustive")
-             if os.path.exists(fallback_path):
-                 model_path = fallback_path
+        # Coleta subpastas de TODOS os output_dirs configurados
+        all_dirs = set(p['output_dir'] for p in full_cfg['hardware_profiles'].values())
+        subfolders_found = []
+        for d in all_dirs:
+            if os.path.exists(d):
+                for f in os.listdir(d):
+                    full_p = os.path.join(d, f)
+                    if os.path.isdir(full_p) and prefix in f:
+                        subfolders_found.append(full_p)
+        
+        if not subfolders_found:
+             print(f"⚠️ Nenhum modelo encontrado contendo '{prefix}'. Buscando fallback...")
+             # Busca fallback em todos os lugares
+             fallback_found = None
+             for d in all_dirs:
+                 fb = os.path.join(d, "0-1-Locutor-speecht5_laps_lora_exhaustive")
+                 if os.path.exists(fb):
+                     fallback_found = fb
+                     break
+             
+             if fallback_found:
+                 model_path = fallback_found
                  print(f"📂 Fallback detectado: {model_path}")
              else:
-                 print(f"❌ Erro: Nenhum modelo validado encontrado em {profile_output_dir}. Use --model_name para especificar manualmente.")
+                 print(f"❌ Erro: Nenhum modelo validado encontrado nos diretórios de saída. Use --model_name para especificar manualmente.")
                  sys.exit(1)
         else:
-             subfolders.sort()
-             model_path = os.path.join(profile_output_dir, subfolders[-1])
-             print(f"📂 Modelo detectado: {subfolders[-1]}")
+             subfolders_found.sort()
+             model_path = subfolders_found[-1]
+             print(f"📂 Modelo detectado: {model_path}")
 
     # 4. Handler e Carregamento
     handler = get_inference_handler(model_type, model_cfg, device, model_path)
@@ -337,30 +372,75 @@ def main():
     speaker_model = EncoderClassifier.from_hparams(source=model_cfg['speaker_encoder_id'], run_opts={"device": device})
     
     with torch.no_grad():
-        emb = speaker_model.encode_batch(torch.tensor(audio_ref))
-        emb = torch.nn.functional.normalize(emb, dim=2).squeeze().to(device).unsqueeze(0)
+        most_common_emb = speaker_model.encode_batch(torch.tensor(audio_ref))
+        most_common_emb = torch.nn.functional.normalize(most_common_emb, dim=2).squeeze().to(device).unsqueeze(0)
 
     # 6. Test Cases
     target_sr = model_cfg.get('sampling_rate', 16000)
-    cases = [
-        ("caso1_standard", "O treinamento foi finalizado e agora estamos testando a voz em português."),
-        ("caso2_paris", "Há algumas coisas que não podem deixar de serem vistas em Paris."),
-        (f"caso3_extra", f"Olá! Tudo bem com você?? Eu estou ótimo!!!!! \
-        Estamos testando o suporte multi-modelo para {model_type.upper()}. \
-        A ideia é ver como ele se comporta com diferentes tipos de texto, considerando elementos como prosódia, entonação e ritmo.")
-    ]
+    cases = []
     
+    # Casos Originais
+    cases.append((
+        "caso1_standard", 
+        "O treinamento foi finalizado e agora estamos testando a voz em português.", 
+        most_common_emb, 
+        most_common_spk
+    ))
+    cases.append((
+        "caso2_paris", 
+        "Há algumas coisas que não podem deixar de serem vistas em Paris.", 
+        most_common_emb, 
+        most_common_spk
+    ))
+    cases.append((
+        "caso3_extra", 
+        f"Olá! Tudo bem com você?? Eu estou ótimo!!!!! Estamos testando o suporte multi-modelo para {model_type.upper()}. A ideia é ver como ele se comporta com diferentes tipos de texto.", 
+        most_common_emb, 
+        most_common_spk
+    ))
+    
+    # Processar dataset_split.json se existir
+    import json
+    split_path = os.path.join(model_path, "dataset_split.json")
+    if os.path.exists(split_path):
+        print("\n🔍 Lendo configurações de Zero-Shot Split (dataset_split.json)...")
+        with open(split_path, 'r', encoding='utf-8') as f:
+            split_info = json.load(f)
+        
+        test_spks = split_info.get("test_speakers", [])
+        if test_spks:
+            print(f"   👥 Locutores reservados para Teste Zero-Shot encontrados: {test_spks}")
+            
+            seen_test_spks = set()
+            for s_id, item in zip(all_speakers, dataset):
+                if s_id in test_spks and s_id not in seen_test_spks:
+                    seen_test_spks.add(s_id)
+                    text = item.get("text", "")
+                    audio = item["audio"]["array"]
+                    
+                    with torch.no_grad():
+                        emb = speaker_model.encode_batch(torch.tensor(audio))
+                        emb = torch.nn.functional.normalize(emb, dim=2).squeeze().to(device).unsqueeze(0)
+                        
+                    cases.append((f"zero_shot_{s_id}", text, emb, s_id))
+                    
+                    if len(seen_test_spks) == len(test_spks):
+                        break
+
     print("\n🎧 Gerando áudios e Validando Métricas...")
     
     validation_metrics = []
     
-    for filename, text in cases:
+    for filename, text, emb, spk_id in cases:
         clean_text = normalize_text(text)
-        print(f"   📝 {filename}: '{clean_text}'")
+        print(f"\n   👤 Usando Voz: '{spk_id}' | Origem: {'Teste Invisível' if 'zero_shot' in filename else 'Conhecido (Fixos)'}")
+        print(f"   📝 Mensagem: '{clean_text}'")
+        print(f"   ⚙️  ID Local do Teste: {filename}")
         
         # 7. Medir Latência
         start_time = time.time()
         audio_out = handler.generate(clean_text, emb)
+
         gen_time = time.time() - start_time
         
         # Calcular RTF (Real Time Factor)
