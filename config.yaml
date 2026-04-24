@@ -58,8 +58,8 @@ models:
       r: 256
       alpha: 512
       dropout: 0.0
-      # Focando nas camadas de atenção e feed-forward dos blocos Transformer
-      target_modules: ["linear_q", "linear_k", "linear_v", "linear_out", "conv1", "conv2"]
+      # Focando nas camadas de atenção, feed-forward, Pitch Predictor e Duration Predictor
+      target_modules: ["linear_q", "linear_k", "linear_v", "linear_out", "conv1", "conv2", "conv_1", "conv_2", "proj", "pitch_emb"]
 
   matcha:
     id: "shivammehta25/Matcha-TTS"
@@ -114,7 +114,7 @@ dataset_profiles:
       test_speakers: 4
     training:
       learning_rate: 0.0002 # FS2 aceita LR um pouco mais alta que o SpeechT5
-      num_epochs: 600
+      num_epochs: 300
       save_steps: 500
       logging_steps: 100
 

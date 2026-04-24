@@ -585,7 +585,7 @@ class FastSpeech2Handler(ModelHandler):
         # Extração de Mel
         import librosa
         mel_spec = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0, fmax=sr//2
+            y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0
         )
         log_mel = np.log10(np.clip(mel_spec, 1e-5, None))
         
