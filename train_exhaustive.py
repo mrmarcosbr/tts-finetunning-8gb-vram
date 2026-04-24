@@ -6,8 +6,21 @@ from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente (HF_TOKEN)
 load_dotenv()
-import yaml
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+# Fix para PyTorch 2.6 e resume do Trainer
+# O PyTorch 2.6 restringe load() de estados do numpy salvos pelo transformers.
+# Como confiamos nos nossos próprios checkpoints, vamos permitir o carregamento.
+_original_load = torch.load
+def safe_load(*args, **kwargs):
+    if "weights_only" not in kwargs: kwargs["weights_only"] = False
+    return _original_load(*args, **kwargs)
+torch.load = safe_load
+
+import yaml
 import torchaudio
 import unicodedata
 import argparse
@@ -22,8 +35,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union, Optional
 from collections import Counter
 
-from datasets import load_dataset, Audio, Dataset
-from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan
+from datasets import load_dataset, Audio, Dataset, load_from_disk
+from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan, TrainerCallback
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
 
@@ -34,6 +47,7 @@ if sys.stdout.encoding.lower() != 'utf-8':
 # --- Funções Utilitárias ---
 def normalize_text(text):
     if not text: return ""
+    text = text.lower().replace('\n', ' ').strip()
     return ''.join(c for c in unicodedata.normalize('NFD', text)
                    if unicodedata.category(c) != 'Mn')
 
@@ -91,7 +105,7 @@ class ModelHandler:
         self.processor = None
         self.model = None
 
-    def load(self):
+    def load(self, resume_from=None):
         raise NotImplementedError()
 
     def prepare_item(self, item, processor, speaker_model):
@@ -101,7 +115,7 @@ class ModelHandler:
         raise NotImplementedError()
 
 class SpeechT5Handler(ModelHandler):
-    def load(self):
+    def load(self, resume_from=None):
         print(f"📥 Carregando SpeechT5: {self.model_cfg['id']}")
         self.processor = SpeechT5Processor.from_pretrained(self.model_cfg['id'])
         self.vocoder = SpeechT5HifiGan.from_pretrained(self.model_cfg['vocoder_id']).to(self.device)
@@ -109,15 +123,26 @@ class SpeechT5Handler(ModelHandler):
         SpeechT5ForTextToSpeech._keys_to_ignore_on_load_unexpected = [r'.*encode_positions\.pe']
         self.model = SpeechT5ForTextToSpeech.from_pretrained(self.model_cfg['id'])
         
-        # Aplicar LoRA
+        # Aplicar LoRA ou Carregar existente
         lora_cfg = self.model_cfg['lora']
         peft_config = LoraConfig(
             r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'], 
             target_modules=lora_cfg['target_modules'], lora_dropout=lora_cfg['dropout'], 
             bias="none", task_type=None
         )
-        self.model = get_peft_model(self.model, peft_config)
-        return self.model, self.processor
+        
+        if resume_from and os.path.exists(os.path.join(resume_from, "adapter_config.json")):
+            print(f"🔄 Carregando adaptadores LoRA existentes de: {resume_from}")
+            self.model = PeftModel.from_pretrained(self.model, resume_from, is_trainable=True)
+        else:
+            self.model = get_peft_model(self.model, peft_config)
+        # Garantir contiguidade em parâmetros e BUFFERS (essencial p/ pos_encoder.pe)
+        for p in self.model.parameters():
+            if not p.is_contiguous(): p.data = p.data.contiguous()
+        for b in self.model.buffers():
+            if not b.is_contiguous(): b.data = b.data.contiguous()
+            
+        return self.model, processor
 
     def prepare_item(self, batch, processor, speaker_model, language=None):
         audio = batch["audio"]
@@ -196,6 +221,8 @@ class F5TTSHandler(ModelHandler):
         )
         from peft import get_peft_model
         self.dit = get_peft_model(self.dit, peft_config)
+        for p in self.dit.parameters():
+            if not p.is_contiguous(): p.data = p.data.contiguous()
         self.dit.to(self.device)
         
         # CFM Wrapper para HF Trainer
@@ -309,7 +336,7 @@ class XTTSHandler(ModelHandler):
         torch.load = trusted_load
         try:
             self.xtts = Xtts.init_from_config(config)
-            self.xtts.load_checkpoint(config, checkpoint_dir=model_path, use_deepspeed=False)
+            self.xtts.load_checkpoint(config, checkpoint_dir=model_path)
         finally:
             torch.load = orig_load
         
@@ -324,6 +351,8 @@ class XTTSHandler(ModelHandler):
             )
             # Aplicar LoRA especificamente ao sub-módulo GPT
             self.xtts.gpt = get_peft_model(self.xtts.gpt, peft_config)
+            for p in self.xtts.gpt.parameters():
+                if not p.is_contiguous(): p.data = p.data.contiguous()
             print(f"✅ LoRA aplicado ao GPT do XTTS v2.")
         
         self.xtts.to(self.device)
@@ -390,6 +419,320 @@ class XTTSHandler(ModelHandler):
                 }
         return XTTSDataCollator()
 
+class FastSpeech2Wrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+        # Recuperar a função de loss oficial do Coqui para treinar Pitch/Duration/Energy
+        base_model = getattr(self.model, "base_model", self.model)
+        if hasattr(base_model, "model"): base_model = base_model.model
+        self.criterion = base_model.get_criterion()
+        
+    def forward(self, x=None, x_lengths=None, y=None, y_lengths=None, **kwargs):
+        pitch = kwargs.pop('pitch', None)
+        
+        # Cython MAS Aligner e algumas operações do Coqui quebram/geram NaN com FP16
+        # Desabilitamos o autocast especificamente para o forward do modelo
+        with torch.amp.autocast('cuda', enabled=False):
+            if y is not None: y = y.float()
+            if pitch is not None: pitch = pitch.float()
+            
+            outputs = self.model(
+                x=x,
+                x_lengths=x_lengths,
+                y=y,
+                y_lengths=y_lengths,
+                pitch=pitch,
+                **kwargs
+            )
+            
+            if isinstance(outputs, dict) and "loss" in outputs:
+                return outputs
+                
+            # Calcular a Loss Completa do FastPitch (inclui Mel, Duration, Pitch)
+            # Isso é crucial para o LoRA aprender a entonação e ritmo em português!
+            loss_dict = self.criterion(
+                decoder_output=outputs["model_outputs"],
+                decoder_target=y,
+                decoder_output_lens=y_lengths,
+                dur_output=outputs["durations_log"],
+                dur_target=outputs.get("o_alignment_dur", None),
+                pitch_output=outputs.get("pitch_avg", None),
+                pitch_target=outputs.get("pitch_avg_gt", None),
+                energy_output=outputs.get("energy_avg", None),
+                energy_target=outputs.get("energy_avg_gt", None),
+                input_lens=x_lengths,
+                alignment_logprob=outputs.get("alignment_logprob", None),
+                alignment_soft=outputs["alignment_soft"],
+                alignment_hard=outputs["alignment_mas"],
+                binary_loss_weight=0.0
+            )
+            
+            # A loss total já vem calculada e agregada dentro do dict pela Coqui
+            total_loss = loss_dict["loss"]
+            
+        return {"loss": total_loss, "model_outputs": outputs["model_outputs"]}
+
+class FastSpeech2Handler(ModelHandler):
+    def load(self, resume_from=None):
+        try:
+            from TTS.utils.manage import ModelManager
+            from TTS.tts.models.forward_tts import ForwardTTS as FastSpeech2
+            from TTS.tts.configs.fastspeech2_config import Fastspeech2Config as FastSpeech2Config
+            from peft import get_peft_model, LoraConfig, PeftModel
+        except ImportError:
+            print("❌ Erro: Biblioteca 'TTS' (Coqui) não encontrada no .venv_fs2.")
+            sys.exit(1)
+
+        print(f"📥 Carregando FastSpeech 2: {self.model_cfg['id']}")
+        
+        manager = ModelManager()
+        model_path = manager.download_model(self.model_cfg['id'])
+        if isinstance(model_path, tuple): model_path = model_path[0]
+        
+        # Se model_path for um arquivo (ex: model.pth), pegar o diretório pai
+        if os.path.isfile(model_path):
+            model_dir = os.path.dirname(model_path)
+        else:
+            model_dir = model_path
+
+        config_path = os.path.join(model_dir, "config.json")
+        config = FastSpeech2Config()
+        config.load_json(config_path)
+        
+        self.model_fs2 = FastSpeech2.init_from_config(config)
+        self.model_fs2.load_checkpoint(config, checkpoint_path=model_path)
+        
+        # Aplicar LoRA ou Carregar existente
+        lora_cfg = self.model_cfg['lora']
+        peft_config = LoraConfig(
+            r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'], 
+            target_modules=lora_cfg['target_modules'], lora_dropout=lora_cfg['dropout'], 
+            bias="none"
+        )
+
+        if resume_from and (os.path.exists(os.path.join(resume_from, "adapter_config.json")) or os.path.exists(os.path.join(resume_from, "model.safetensors"))):
+            print(f"🔄 Carregando adaptadores LoRA existentes de: {resume_from}")
+            # Se for um diretório de modelo final (com model.safetensors mas sem adapter_config.json pela estrutura do wrapper)
+            # precisamos inicializar o LoRA primeiro e depois carregar os pesos
+            self.model_fs2 = get_peft_model(self.model_fs2, peft_config)
+            
+            # Tentar carregar pesos (lidando com o prefixo 'model.' se necessário)
+            weights_path = os.path.join(resume_from, "model.safetensors")
+            if not os.path.exists(weights_path): weights_path = os.path.join(resume_from, "pytorch_model.bin")
+            
+            if os.path.exists(weights_path):
+                if weights_path.endswith(".safetensors"):
+                    from safetensors.torch import load_file
+                    sd = load_file(weights_path)
+                else:
+                    sd = torch.load(weights_path, map_location="cpu")
+                
+                # Ajustar prefixos do wrapper
+                new_sd = {}
+                for k, v in sd.items():
+                    if k.startswith("model."): new_sd[k[6:]] = v
+                    else: new_sd[k] = v
+                self.model_fs2.load_state_dict(new_sd, strict=False)
+        else:
+            self.model_fs2 = get_peft_model(self.model_fs2, peft_config)
+        
+        # Fix contiguidade (Parâmetros e Buffers)
+        for p in self.model_fs2.parameters():
+            if not p.is_contiguous(): p.data = p.data.contiguous()
+        for b in self.model_fs2.buffers():
+            if not b.is_contiguous(): b.data = b.data.contiguous()
+            
+        print(f"✅ LoRA aplicado ao FastSpeech 2.")
+        
+        self.model = FastSpeech2Wrapper(self.model_fs2)
+        
+        # Substituir o fonemizador original pelo de português (Gruut)
+        try:
+            from TTS.tts.utils.text.phonemizers import get_phonemizer_by_name
+            base_phonemizer = get_phonemizer_by_name("gruut", language="pt")
+            
+            # Criamos um wrapper para mapear fonemas do PT que não existem no modelo Base (Inglês)
+            class PTPhonemizerWrapper:
+                def __init__(self, p): self.p = p
+                def phonemize(self, text, separator="", language="pt"):
+                    ph = self.p.phonemize(text, separator=separator, language=language)
+                    replacements = {'ẽ': 'e', 'ĩ': 'i', 'õ': 'o', 'ũ': 'u', 'ã': 'a', '\u0303': '', 'g': 'ɡ'}
+                    for k, v in replacements.items(): ph = ph.replace(k, v)
+                    return ph
+                def name(self): return "pt_wrapper"
+                def print_logs(self, level): pass
+                
+            new_phonemizer = PTPhonemizerWrapper(base_phonemizer)
+            self.model_fs2.tokenizer.phonemizer = new_phonemizer
+            print(f"🌐 Phonemizer do FastSpeech 2 substituído por Gruut (pt) com mapeamento cross-lingual")
+        except Exception as e:
+            print(f"⚠️ Aviso: Não foi possível trocar o phonemizer: {e}")
+            
+        self.model_fs2.to(self.device)
+        return self.model, self.model_fs2.tokenizer
+
+    def prepare_item(self, batch, processor, speaker_model, language="en"):
+        audio = batch["audio"]
+        y = np.array(audio["array"])
+        sr = audio.get("sampling_rate", 22050)
+        text = normalize_text(batch.get("text", ""))
+        
+        # Tokenização (FS2 usa fonemas internamente via tokenizer)
+        input_ids = processor.text_to_ids(text, language=language)
+        
+        # Extração de Mel
+        import librosa
+        mel_spec = librosa.feature.melspectrogram(
+            y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0, fmax=sr//2
+        )
+        log_mel = np.log10(np.clip(mel_spec, 1e-5, None))
+        
+        # FastSpeech 2 / FastPitch requer pitch (F0) real durante o treino
+        pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=1024, hop_length=256)
+        pitch = np.nan_to_num(pitch)
+        if len(pitch) > log_mel.shape[1]: pitch = pitch[:log_mel.shape[1]]
+        elif len(pitch) < log_mel.shape[1]: pitch = np.pad(pitch, (0, log_mel.shape[1] - len(pitch)))
+        
+        return {
+            "x": torch.tensor(input_ids),
+            "x_lengths": torch.tensor(len(input_ids)),
+            "y": torch.tensor(log_mel.T), # Coqui espera [B, T, C]
+            "y_lengths": torch.tensor(log_mel.shape[1]),
+            "pitch": torch.tensor(pitch).unsqueeze(0).float() # [1, T]
+        }
+
+    def get_collator(self):
+        @dataclass
+        class FS2DataCollator:
+            def __call__(self, features):
+                from torch.nn.utils.rnn import pad_sequence
+                x = pad_sequence([f["x"] for f in features], batch_first=True)
+                y = pad_sequence([f["y"] for f in features], batch_first=True)
+                pitch = pad_sequence([f["pitch"].squeeze(0) for f in features], batch_first=True).unsqueeze(1)
+                x_lengths = torch.stack([f["x_lengths"] for f in features])
+                y_lengths = torch.stack([f["y_lengths"] for f in features])
+                
+                return {
+                    "x": x,
+                    "x_lengths": x_lengths,
+                    "y": y,
+                    "y_lengths": y_lengths,
+                    "pitch": pitch
+                }
+        return FS2DataCollator()
+
+class MatchaWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+    def forward(self, x=None, x_lengths=None, y=None, y_lengths=None, **kwargs):
+        # Matcha-TTS (Lightning module) retorna loss no método forward ou compute_loss
+        # x: input_ids, y: mel
+        outputs = self.model(
+            x=x, x_lengths=x_lengths, y=y, y_lengths=y_lengths, **kwargs
+        )
+        return {"loss": outputs["loss"]}
+
+class MatchaHandler(ModelHandler):
+    def load(self):
+        try:
+            from matcha.models.matcha_tts import MatchaTTS
+        except ImportError:
+            print("❌ Erro: Biblioteca 'matcha-tts' não encontrada no .venv_matcha.")
+            sys.exit(1)
+
+        print(f"📥 Carregando Matcha-TTS: {self.model_cfg['id']}")
+        
+        # O Matcha-TTS costuma ser carregado via checkpoint (.ckpt)
+        # Para simplificar o LoRA, assumimos que o modelo base está disponível ou baixado
+        # Ex: self.model_matcha = MatchaTTS.load_from_checkpoint(checkpoint_path)
+        # Aqui inicializamos um modelo base para aplicar o LoRA
+        # Nota: Uma implementação real precisaria do config exato.
+        self.model_matcha = MatchaTTS(...) # Placeholder para inicialização real
+        
+        # Aplicar LoRA no Decoder (DiT/Transformer) do Matcha
+        lora_cfg = self.model_cfg['lora']
+        peft_config = LoraConfig(
+            r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'], 
+            target_modules=lora_cfg['target_modules'], lora_dropout=lora_cfg['dropout'], 
+            bias="none"
+        )
+        self.model_matcha.decoder = get_peft_model(self.model_matcha.decoder, peft_config)
+        for p in self.model_matcha.parameters():
+            if not p.is_contiguous(): p.data = p.data.contiguous()
+            
+        self.model_matcha.to(self.device)
+        self.model = MatchaWrapper(self.model_matcha)
+        return self.model, None # Matcha usa phonemizer diretamente no prepare
+
+    def prepare_item(self, batch, processor, speaker_model, language="en"):
+        # Preparação específica para o Flow Matching do Matcha
+        audio = batch["audio"]
+        y = np.array(audio["array"])
+        sr = audio.get("sampling_rate", 22050)
+        text = normalize_text(batch.get("text", ""))
+        
+        # Matcha usa phonemizer externo
+        from matcha.utils.cleaners import english_cleaners
+        clean_text = english_cleaners(text)
+        
+        # Extração de Mel
+        import librosa
+        mel = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80)
+        log_mel = np.log10(np.clip(mel, 1e-5, None)).T
+        
+        return {
+            "x": torch.tensor([0]), # IDs do texto (Placeholder)
+            "y": torch.tensor(log_mel),
+            "x_lengths": torch.tensor(1),
+            "y_lengths": torch.tensor(log_mel.shape[0])
+        }
+
+    def get_collator(self):
+        @dataclass
+        class MatchaDataCollator:
+            def __call__(self, features):
+                from torch.nn.utils.rnn import pad_sequence
+                x = pad_sequence([f["x"] for f in features], batch_first=True)
+                y = pad_sequence([f["y"] for f in features], batch_first=True, padding_value=-5.0)
+                return {"x": x, "y": y, "x_lengths": torch.tensor([f["x_lengths"] for f in features]), "y_lengths": torch.tensor([f["y_lengths"] for f in features])}
+        return MatchaDataCollator()
+
+class GlowTTSHandler(FastSpeech2Handler):
+    # Glow-TTS compartilha muita lógica com o FastSpeech 2 na Coqui
+    def load(self):
+        try:
+            from TTS.utils.manage import ModelManager
+            from TTS.tts.models.glow_tts import GlowTTS
+            from TTS.tts.configs.glow_tts_config import GlowTTSConfig
+        except ImportError:
+            print("❌ Erro: Biblioteca 'TTS' (Coqui) não encontrada no .venv_fs2.")
+            sys.exit(1)
+
+        print(f"📥 Carregando Glow-TTS: {self.model_cfg['id']}")
+        manager = ModelManager()
+        model_path = manager.download_model(self.model_cfg['id'])
+        if isinstance(model_path, tuple): model_path = model_path[0]
+        
+        config = GlowTTSConfig()
+        config.load_json(os.path.join(model_path, "config.json"))
+        self.model_glow = GlowTTS.init_from_config(config)
+        self.model_glow.load_checkpoint(config, checkpoint_dir=model_path)
+        
+        # LoRA no Encoder do Glow-TTS
+        lora_cfg = self.model_cfg['lora']
+        peft_config = LoraConfig(target_modules=lora_cfg['target_modules'], r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'])
+        self.model_glow.encoder = get_peft_model(self.model_glow.encoder, peft_config)
+        for p in self.model_glow.parameters():
+            if not p.is_contiguous(): p.data = p.data.contiguous()
+            
+        self.model_glow.to(self.device)
+        self.model = FastSpeech2Wrapper(self.model_glow) # Reutiliza wrapper de loss
+        return self.model, self.model_glow.tokenizer
+
 class GenericSOTAHandler(ModelHandler):
     def load(self):
         print(f"⚠️ O modelo {self.model_cfg['id']} requer implementações customizadas.")
@@ -400,6 +743,12 @@ def get_handler(model_type, model_cfg, device):
         return SpeechT5Handler(model_cfg, device)
     elif model_type == 'f5_tts':
         return F5TTSHandler(model_cfg, device)
+    elif model_type == 'fastspeech2':
+        return FastSpeech2Handler(model_cfg, device)
+    elif model_type == 'matcha':
+        return MatchaHandler(model_cfg, device)
+    elif model_type == 'glow_tts':
+        return GlowTTSHandler(model_cfg, device)
     elif model_type in ['xtts_v2', 'your_tts']:
         return XTTSHandler(model_cfg, device)
     else:
@@ -409,11 +758,25 @@ def get_handler(model_type, model_cfg, device):
 # MAIN LOGIC
 # ==============================================================================
 
+class ValidationCallback(TrainerCallback):
+    """Callback para mostrar detalhes extras da validação no terminal."""
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics:
+            print(f"\n✨ [VALIDAÇÃO] Época: {state.epoch:.2f} | Passo: {state.global_step}")
+            for key, value in metrics.items():
+                name = key.replace("eval_", "📊 ").replace("_", " ").title()
+                if isinstance(value, float):
+                    print(f"   {name}: {value:.4f}")
+                else:
+                    print(f"   {name}: {value}")
+            print("--------------------------------------------------\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Treinamento TTS Generalizado con LoRA")
     parser.add_argument("--profile", type=str, default=None, help="Perfil de hardware (opcional)")
     parser.add_argument("--dataset", type=str, default=None, help="Perfil do dataset configurado no YAML")
     parser.add_argument("--config", type=str, default="config.yaml", help="Caminho do arquivo config.yaml")
+    parser.add_argument("--resume_from", type=str, default=None, help="Caminho para checkpoint ou modelo para continuar treinamento")
     args = parser.parse_args()
 
     full_cfg = load_config(args.config)
@@ -455,12 +818,15 @@ def main():
 
     # 4. Handler e Carregamento do Modelo
     handler = get_handler(model_type, model_cfg, device)
-    model, processor = handler.load()
+    model, processor = handler.load(resume_from=args.resume_from)
 
     # 5. Dataset Loading
+    local_root = full_cfg.get('settings', {}).get('local_datasets_dir', './datasets')
     repo_name = ds_cfg['dataset_id'].split('/')[-1]
-    local_ds_path = os.path.join(".", "meus_datasets", repo_name)
-    is_local = os.path.exists(local_ds_path)
+    local_ds_path = os.path.join(local_root, repo_name)
+    
+    # Se o diretório existir e contiver arquivos, consideramos local
+    is_local = os.path.exists(local_ds_path) and len(os.listdir(local_ds_path)) > 0 if os.path.exists(local_ds_path) else False
     
     print(f"📥 Carregando dataset '{ds_cfg['dataset_id']}' (Local: {is_local})...")
     
@@ -497,21 +863,25 @@ def main():
     else:
         load_kwargs = {"split": ds_cfg['dataset_split']}
         if is_local:
-            load_kwargs["path"] = local_ds_path
-            load_kwargs["streaming"] = False
+            print(f"📂 Carregando dataset local de: {local_ds_path}")
+            dataset_stream = load_from_disk(local_ds_path)
         else:
             load_kwargs["path"] = ds_cfg['dataset_id']
             load_kwargs["streaming"] = ds_cfg.get('streaming', True)
             if 'dataset_config' in ds_cfg: load_kwargs["name"] = ds_cfg['dataset_config']
-            
-        dataset_stream = load_dataset(**load_kwargs)
+            dataset_stream = load_dataset(**load_kwargs)
         
         for item in dataset_stream:
             if "wav" in item and "audio" not in item: item["audio"] = item["wav"]
             if "txt" in item and "text" not in item: item["text"] = item["txt"]
             all_data.append(item)
-            
         full_ds = Dataset.from_list(all_data)
+        
+        # Salvar localmente se não for local para evitar downloads futuros
+        if not is_local:
+            print(f"💾 Salvando dataset localmente em: {local_ds_path}")
+            os.makedirs(os.path.dirname(local_ds_path), exist_ok=True)
+            full_ds.save_to_disk(local_ds_path)
     
     # Seleção de Locutores e Amostragem Balanceada
     all_speakers = [extract_speaker_id(x) for x in all_data]
@@ -561,22 +931,12 @@ def main():
     val_dataset = full_ds.select(val_indices) if val_indices else None
     test_dataset = full_ds.select(test_indices) if test_indices else None
     
-    print("\n📊 --- Resumo do Dataset Balanceado ---")
-    print(f"   👥 Locutores selecionados: {len(valid_spks)} (De um total de {len(counts)} na base)")
-    if zero_shot_split:
-        print(f"   🔀 Divisão Zero-Shot: Treino({len(train_spks)}) | Validação({len(val_spks)}) | Teste({len(test_spks)})")
-    
-    samples_possible = sum(counts[s] for s in valid_spks)
-    print(f"   📈 Total de Áudios (Samples) possíveis com os locutores selecionados: {samples_possible}")
-    print(f"   🎙️ Áudios na fila de Treino: {len(train_dataset)}")
-    if val_dataset: print(f"   🎙️ Áudios na fila de Validação: {len(val_dataset)}")
-    if test_dataset: print(f"   🎙️ Áudios na fila de Teste (Retidos): {len(test_dataset)}")
-    
-    if max_samples > 0:
-        print(f"   ⚖️ Regra de Teto aplicada: Máximo de {max_samples} audios por locutor.")
-    elif num_spk > 0:
-        print(f"   ⚠️ Atenção: Nenhuma limitação de amostragem por voz foi definida (Treino Massivo).")
-    print("----------------------------------------\n")
+    print("\n📊 --- Resumo do Dataset (Divisão 80/10/10 por Locutor) ---")
+    print(f"   👥 Locutores: Total({len(counts)}) | Selecionados({len(valid_spks)})")
+    print(f"   🔀 Divisão por Locutor: Treino({len(train_spks)}) | Validação({len(val_spks)}) | Teste({len(test_spks)})")
+    print(f"   🎙️ Amostras: Treino({len(train_dataset)}) | Validação({len(val_dataset) if val_dataset else 0}) | Teste({len(test_dataset) if test_dataset else 0})")
+    print(f"   ⚖️ Teto: {max_samples if max_samples > 0 else 'Ilimitado'} audios/locutor")
+    print("----------------------------------------------------------\n")
     
     # Exportar dataset_split.json
     import json
@@ -608,13 +968,31 @@ def main():
         speaker_model = EncoderClassifier.from_hparams(source=model_cfg['speaker_encoder_id'], run_opts={"device": device})
     
     language = ds_cfg.get("language", "pt")
-    processed_train_ds = train_dataset.map(lambda x: handler.prepare_item(x, processor, speaker_model, language), remove_columns=train_dataset.column_names)
-    processed_train_ds.set_format(type="torch")
+    
+    # Sistema de Cache Hard (Disco)
+    cache_base_dir = os.path.join(full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'), "cache_processado", f"{model_type}_{dataset_name}_{target_sr}hz")
+    train_cache_path = os.path.join(cache_base_dir, "train")
+    val_cache_path = os.path.join(cache_base_dir, "val")
+    
+    if os.path.exists(train_cache_path):
+        print(f"⚡ Carregando dataset TRAIN processado do cache: {train_cache_path}")
+        processed_train_ds = load_from_disk(train_cache_path)
+    else:
+        processed_train_ds = train_dataset.map(lambda x: handler.prepare_item(x, processor, speaker_model, language), remove_columns=train_dataset.column_names)
+        processed_train_ds.set_format(type="torch")
+        processed_train_ds.save_to_disk(train_cache_path)
+        print(f"💾 Cache TRAIN salvo em: {train_cache_path}")
     
     processed_val_ds = None
     if val_dataset:
-        processed_val_ds = val_dataset.map(lambda x: handler.prepare_item(x, processor, speaker_model, language), remove_columns=val_dataset.column_names)
-        processed_val_ds.set_format(type="torch")
+        if os.path.exists(val_cache_path):
+            print(f"⚡ Carregando dataset VAL processado do cache: {val_cache_path}")
+            processed_val_ds = load_from_disk(val_cache_path)
+        else:
+            processed_val_ds = val_dataset.map(lambda x: handler.prepare_item(x, processor, speaker_model, language), remove_columns=val_dataset.column_names)
+            processed_val_ds.set_format(type="torch")
+            processed_val_ds.save_to_disk(val_cache_path)
+            print(f"💾 Cache VAL salvo em: {val_cache_path}")
 
     # 7. Training
     train_params = ds_cfg['training']
@@ -626,10 +1004,11 @@ def main():
         "learning_rate": train_params['learning_rate'], 
         "num_train_epochs": train_params['num_epochs'],
         "logging_steps": train_params['logging_steps'],
-        "save_steps": train_params['save_steps'], 
+        "save_strategy": "steps",
+        "save_steps": train_params['save_steps'], # Salvando a cada 10 épocas (aprox. 1750 passos com batch 4)
+        "save_total_limit": 1,
         "weight_decay": train_params.get('weight_decay', 0.0),
         "fp16": hw_cfg['fp16'],
-        "save_total_limit": 1,
         "dataloader_num_workers": 0,
         "remove_unused_columns": False,
         "report_to": "none"
@@ -645,7 +1024,9 @@ def main():
         "model": model, 
         "args": training_args, 
         "train_dataset": processed_train_ds, 
-        "data_collator": handler.get_collator()
+        "eval_dataset": processed_val_ds, # Habilitando validação
+        "data_collator": handler.get_collator(),
+        "callbacks": [ValidationCallback()] # Adicionando callback customizado
     }
     
     if processed_val_ds:
@@ -654,7 +1035,31 @@ def main():
     trainer = Trainer(**trainer_kwargs)
     
     print("\n🏁 Iniciando Treinamento...")
-    trainer.train()
+    if args.resume_from:
+        print(f"🔄 Retomando treinamento a partir de: {args.resume_from}")
+        
+        # Patch para compatibilidade de versão do TrainerState
+        # Remove chaves obsoletas como 'best_global_step' que causam erro no transformers 4.44+
+        state_path = os.path.join(args.resume_from, "trainer_state.json")
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    state_data = json.load(f)
+                
+                dirty = False
+                for key in ["best_global_step"]:
+                    if key in state_data:
+                        del state_data[key]
+                        dirty = True
+                
+                if dirty:
+                    with open(state_path, "w", encoding="utf-8") as f:
+                        json.dump(state_data, f, indent=2)
+                    print(f"   🩹 Patch aplicado ao trainer_state.json (removidas chaves obsoletas).")
+            except Exception as e:
+                print(f"   ⚠️ Aviso ao aplicar patch no state: {e}")
+    
+    trainer.train(resume_from_checkpoint=args.resume_from)
     
     # 8. Saving Final Model
     print("\n💾 Salvando modelo final...")

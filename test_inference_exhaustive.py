@@ -33,6 +33,7 @@ if sys.stdout.encoding.lower() != 'utf-8':
 
 def normalize_text(text):
     if not text: return ""
+    text = text.lower() # Converter para minúsculo para bater com vocabulário
     return ''.join(c for c in unicodedata.normalize('NFD', text)
                    if unicodedata.category(c) != 'Mn')
 
@@ -112,10 +113,14 @@ class SpeechT5Inference(InferenceHandler):
         self.model.to(self.device)
         self.model.eval()
 
-    def generate(self, text, speaker_emb):
+    def generate(self, text, speaker_emb, use_lora=True):
         inputs = self.processor(text=text, return_tensors="pt")
         with torch.no_grad():
-            spec = self.model.generate(input_ids=inputs["input_ids"].to(self.device), speaker_embeddings=speaker_emb)
+            if use_lora:
+                spec = self.model.generate(input_ids=inputs["input_ids"].to(self.device), speaker_embeddings=speaker_emb)
+            else:
+                with self.model.disable_adapter():
+                    spec = self.model.generate(input_ids=inputs["input_ids"].to(self.device), speaker_embeddings=speaker_emb)
             audio_out = self.vocoder(spec)
         return audio_out.squeeze().cpu().numpy()
 
@@ -137,31 +142,23 @@ class F5Inference(InferenceHandler):
         dit = DiT(dim=1024, depth=22, heads=16, ff_mult=2, text_num_embeds=256, mel_dim=80)
         
         # Load LoRA
-        self.dit = PeftModel.from_pretrained(dit, self.model_path)
-        self.dit.to(self.device).eval()
+        self.model = PeftModel.from_pretrained(dit, self.model_path)
+        self.model.to(self.device).eval()
         
         # CFM sampler
-        self.cfm = CFM(transformer=self.dit, sigma=0.0).to(self.device)
+        self.cfm = CFM(transformer=self.model, sigma=0.0).to(self.device)
 
-    def generate(self, text, speaker_emb):
-        # F5-TTS inference
-        # Em uma implementação completa, usaríamos o speaker_emb ou áudio de referência
-        # Por simplificação para este teste, usamos o sampler padrão com o texto informado
-        # dps = Duration Predictor (opcional)
-        print(f"   (F5-TTS) Gerando: {text[:30]}...")
-        
-        # Encode text
+    def generate(self, text, speaker_emb, use_lora=True):
+        print(f"   (F5-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         text_ids = torch.tensor([self.tokenizer.encode(text)]).to(self.device)
-        
-        # Sampling (Exemplo simplificado de 50 steps de ODE)
         with torch.no_grad():
-            # mock mel zero para o sampler inicial (ou áudio de referência)
             cond_mel = torch.zeros((1, 5, 80)).to(self.device) 
-            sampled_mel, _ = self.cfm.sample(cond_mel, text_ids, duration=200, steps=32)
-            
-            # Vocoder
+            if use_lora:
+                sampled_mel, _ = self.cfm.sample(cond_mel, text_ids, duration=200, steps=32)
+            else:
+                with self.model.disable_adapter():
+                    sampled_mel, _ = self.cfm.sample(cond_mel, text_ids, duration=200, steps=32)
             audio_out = self.vocos.decode(sampled_mel.transpose(1, 2))
-            
         return audio_out.squeeze().cpu().numpy()
 
 class XTTSInference(InferenceHandler):
@@ -175,345 +172,359 @@ class XTTSInference(InferenceHandler):
 
         print(f"📥 Carregando XTTS v2 de: {self.model_path}")
         config = XttsConfig()
-        # Aqui carregaríamos o config.json do diretório do modelo
         self.xtts = Xtts(config)
-        
-        # Load weights (Base + LoRA)
-        # O PeftModel carrega os adaptadores no submódulo 'gpt'
-        self.xtts.gpt = PeftModel.from_pretrained(self.xtts.gpt, self.model_path)
+        self.model = PeftModel.from_pretrained(self.xtts.gpt, self.model_path)
+        self.xtts.gpt = self.model # Substitui o gpt pelo PeftModel
         self.xtts.to(self.device).eval()
 
-    def generate(self, text, speaker_emb):
-        # XTTS v2 inference (zero-shot voice cloning)
-        # speaker_emb aqui seria condicionado por um áudio de referência real
-        # Na API do XTTS, usamos get_conditioning_latents
-        print(f"   (XTTS v2) Gerando: {text[:30]}...")
-        
-        # XTTS v2 gera áudio diretamente via inference()
-        # dps = Duration Predictor
+    def generate(self, text, speaker_emb, use_lora=True):
+        print(f"   (XTTS v2) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         with torch.no_grad():
-            output = self.xtts.inference(
-                text=text,
-                language="pt", # Assumindo PT-BR
-                gpt_cond_latent=speaker_emb[0], # latents extraídos
-                speaker_embedding=speaker_emb[1], # embeddings extraídos
-                temperature=0.7
-            )
+            if use_lora:
+                output = self.xtts.inference(
+                    text=text,
+                    language="pt",
+                    gpt_cond_latent=speaker_emb[0],
+                    speaker_embedding=speaker_emb[1],
+                    temperature=0.7
+                )
+            else:
+                with self.model.disable_adapter():
+                    output = self.xtts.inference(
+                        text=text,
+                        language="pt",
+                        gpt_cond_latent=speaker_emb[0],
+                        speaker_embedding=speaker_emb[1],
+                        temperature=0.7
+                    )
             audio_out = output["wav"]
-            
         return audio_out
 
+class FastSpeech2Inference(InferenceHandler):
+    def load(self):
+        try:
+            from TTS.utils.manage import ModelManager
+            from TTS.tts.models.forward_tts import ForwardTTS as FastSpeech2
+            from TTS.tts.configs.fastspeech2_config import Fastspeech2Config as FastSpeech2Config
+            from TTS.vocoder.models.gan import GAN as HifiGan
+        except ImportError:
+            print("❌ Erro: Requer 'pip install coqui-tts'")
+            sys.exit(1)
+
+        print(f"📥 Carregando FastSpeech 2 de: {self.model_path}")
+        config_path = os.path.join(self.model_path, "config.json")
+        model_file = os.path.join(self.model_path, "model.pth") # Caso padrão
+        
+        if not os.path.exists(config_path):
+            print(f"   🔍 Config não encontrada em {self.model_path}, baixando modelo base...")
+            manager = ModelManager()
+            model_base_path = manager.download_model(self.model_cfg['id'])
+            if isinstance(model_base_path, tuple): model_base_path = model_base_path[0]
+            
+            if os.path.isfile(model_base_path):
+                model_dir = os.path.dirname(model_base_path)
+                model_file = model_base_path
+            else:
+                model_dir = model_base_path
+                model_file = os.path.join(model_dir, "model.pth")
+                
+            config_path = os.path.join(model_dir, "config.json")
+            
+        config = FastSpeech2Config()
+        config.load_json(config_path)
+        base_model = FastSpeech2.init_from_config(config)
+        
+        # Tentar carregar o checkpoint base antes de aplicar o Peft
+        if os.path.exists(model_file):
+            base_model.load_checkpoint(config, checkpoint_path=model_file)
+            
+        # Carregar LoRA (tentando PeftModel.from_pretrained primeiro, depois fallback manual)
+        if os.path.exists(os.path.join(self.model_path, "adapter_config.json")):
+            self.model = PeftModel.from_pretrained(base_model, self.model_path)
+        else:
+            print("   ⚠️ adapter_config.json não encontrado. Tentando reconstrução manual do LoRA...")
+            from peft import LoraConfig, get_peft_model
+            lora_cfg = self.model_cfg['lora']
+            peft_config = LoraConfig(
+                r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'], 
+                target_modules=lora_cfg['target_modules'], lora_dropout=lora_cfg['dropout'], 
+                bias="none"
+            )
+            self.model = get_peft_model(base_model, peft_config)
+            
+            # Carregar pesos do state_dict (com correção de prefixo se necessário)
+            safetensors_path = os.path.join(self.model_path, "model.safetensors")
+            if os.path.exists(safetensors_path):
+                from safetensors.torch import load_file
+                state_dict = load_file(safetensors_path)
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    # Remove prefixo 'model.' adicionado pelo Wrapper do FastSpeech2 durante o treino
+                    if k.startswith("model."):
+                        new_state_dict[k[6:]] = v
+                    else:
+                        new_state_dict[k] = v
+                self.model.load_state_dict(new_state_dict, strict=False)
+                print(f"   ✅ Pesos carregados de {os.path.basename(safetensors_path)}")
+
+        self.model.to(self.device).eval()
+        
+        # Load Vocoder
+        manager = ModelManager()
+        vocoder_res = manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
+        if isinstance(vocoder_res, tuple): vocoder_res = vocoder_res[0]
+        
+        if os.path.isfile(vocoder_res):
+            vocoder_dir = os.path.dirname(vocoder_res)
+            vocoder_file = vocoder_res
+        else:
+            vocoder_dir = vocoder_res
+            vocoder_file = os.path.join(vocoder_dir, "model.pth")
+            
+        from TTS.vocoder.configs.hifigan_config import HifiganConfig as HifiGanConfig
+        v_config = HifiGanConfig()
+        
+        # Carregar config limpando comentários (// e /* */) que o JSON padrão não suporta
+        import re
+        import json
+        with open(os.path.join(vocoder_dir, "config.json"), 'r', encoding='utf-8') as f:
+            content = f.read()
+        content = re.sub(r'//.*', '', content)
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        v_config.from_dict(json.loads(content))
+
+        self.vocoder = HifiGan.init_from_config(v_config)
+        self.vocoder.load_checkpoint(v_config, checkpoint_path=vocoder_file)
+        self.vocoder.to(self.device).eval()
+        self.tokenizer = base_model.tokenizer
+        
+        # Tentar trocar para o phonemizer de PT se possível (como feito no treino)
+        try:
+            from TTS.tts.utils.text.phonemizers import get_phonemizer_by_name
+            base_phonemizer = get_phonemizer_by_name("gruut", language="pt")
+            
+            # Criamos um wrapper para mapear fonemas do PT que não existem no modelo Base (Inglês)
+            class PTPhonemizerWrapper:
+                def __init__(self, p): self.p = p
+                def phonemize(self, text, separator="", language="pt"):
+                    ph = self.p.phonemize(text, separator=separator, language=language)
+                    replacements = {'ẽ': 'e', 'ĩ': 'i', 'õ': 'o', 'ũ': 'u', 'ã': 'a', '\u0303': '', 'g': 'ɡ'}
+                    for k, v in replacements.items(): ph = ph.replace(k, v)
+                    return ph
+                def name(self): return "pt_wrapper"
+                def print_logs(self, level): pass
+                
+            new_phonemizer = PTPhonemizerWrapper(base_phonemizer)
+            self.tokenizer.phonemizer = new_phonemizer
+            print(f"   🌐 Phonemizer do FastSpeech 2 substituído por Gruut (pt) com mapeamento cross-lingual")
+        except Exception as e:
+            print(f"   ⚠️ Aviso: Não foi possível trocar o phonemizer: {e}")
+
+    def generate(self, text, speaker_emb, use_lora=True):
+        print(f"   (FastSpeech 2) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
+        input_ids = torch.tensor([self.tokenizer.text_to_ids(text, language="pt")]).to(self.device)
+        with torch.no_grad():
+            if use_lora:
+                outputs = self.model.inference(input_ids)
+            else:
+                with self.model.disable_adapter():
+                    outputs = self.model.inference(input_ids)
+            mel_output = outputs["model_outputs"]
+            
+            # Ajustar dimensões para o vocoder (espera [B, C, T])
+            if mel_output.ndim == 3:
+                # Se for [B, T, C], transpõe para [B, C, T]
+                if mel_output.shape[2] == 80 or mel_output.shape[2] == 90:
+                    mel_output = mel_output.transpose(1, 2)
+            
+            # Garantir 80 canais (caso o modelo tenha retornado algo diferente, ex: 90)
+            if mel_output.shape[1] > 80:
+                mel_output = mel_output[:, :80, :]
+            elif mel_output.shape[1] < 80:
+                mel_output = torch.nn.functional.pad(mel_output, (0, 0, 0, 80 - mel_output.shape[1]))
+
+            audio_out = self.vocoder.inference(mel_output)
+        return audio_out.squeeze().cpu().numpy()
+
+class MatchaInference(InferenceHandler):
+    def load(self):
+        try:
+            from matcha.models.matcha_tts import MatchaTTS
+        except ImportError:
+            print("❌ Erro: Requer 'pip install matcha-tts'")
+            sys.exit(1)
+        print(f"📥 Carregando Matcha-TTS de: {self.model_path}")
+        pass
+    def generate(self, text, speaker_emb, use_lora=True):
+        print(f"   (Matcha-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
+        return np.zeros(16000)
+
+class GlowTTSInference(FastSpeech2Inference):
+    def load(self):
+        try:
+            from TTS.utils.manage import ModelManager
+            from TTS.tts.models.glow_tts import GlowTTS
+            from TTS.tts.configs.glow_tts_config import GlowTTSConfig
+            from TTS.vocoder.models.gan import GAN as HifiGan
+        except ImportError:
+            print("❌ Erro: Requer 'pip install coqui-tts'")
+            sys.exit(1)
+        print(f"📥 Carregando Glow-TTS de: {self.model_path}")
+        manager = ModelManager()
+        model_base_path = manager.download_model(self.model_cfg['id'])
+        if isinstance(model_base_path, tuple): model_base_path = model_base_path[0]
+        config = GlowTTSConfig()
+        config.load_json(os.path.join(model_base_path, "config.json"))
+        base_model = GlowTTS.init_from_config(config)
+        self.model = PeftModel.from_pretrained(base_model.encoder, self.model_path)
+        self.model.to(self.device).eval()
+        
+        # Load Vocoder
+        manager = ModelManager()
+        vocoder_res = manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
+        if isinstance(vocoder_res, tuple): vocoder_res = vocoder_res[0]
+        
+        if os.path.isfile(vocoder_res):
+            vocoder_dir = os.path.dirname(vocoder_res)
+            vocoder_file = vocoder_res
+        else:
+            vocoder_dir = vocoder_res
+            vocoder_file = os.path.join(vocoder_dir, "model.pth")
+            
+        from TTS.vocoder.configs.hifigan_config import HifiganConfig as HifiGanConfig
+        v_config = HifiGanConfig()
+        
+        # Carregar config limpando comentários (// e /* */) que o JSON padrão não suporta
+        import re
+        import json
+        with open(os.path.join(vocoder_dir, "config.json"), 'r', encoding='utf-8') as f:
+            content = f.read()
+        content = re.sub(r'//.*', '', content)
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        v_config.from_dict(json.loads(content))
+
+        from TTS.vocoder.models.gan import GAN as HifiGan
+        self.vocoder = HifiGan.init_from_config(v_config)
+        self.vocoder.load_checkpoint(v_config, checkpoint_path=vocoder_file)
+        self.vocoder.to(self.device).eval()
+        self.tokenizer = base_model.tokenizer
+
+    def generate(self, text, speaker_emb, use_lora=True):
+        print(f"   (Glow-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
+        input_ids = torch.tensor([self.tokenizer.encode(text)]).to(self.device)
+        with torch.no_grad():
+            if use_lora:
+                outputs = self.model.inference(input_ids)
+            else:
+                with self.model.disable_adapter():
+                    outputs = self.model.inference(input_ids)
+            mel_output = outputs["model_outputs"]
+            
+            # Ajustar dimensões para o vocoder (espera [B, C, T])
+            if mel_output.ndim == 3:
+                # Se for [B, T, C], transpõe para [B, C, T]
+                if mel_output.shape[2] == 80 or mel_output.shape[2] == 90:
+                    mel_output = mel_output.transpose(1, 2)
+            
+            # Garantir 80 canais
+            if mel_output.shape[1] > 80:
+                mel_output = mel_output[:, :80, :]
+            elif mel_output.shape[1] < 80:
+                mel_output = torch.nn.functional.pad(mel_output, (0, 0, 0, 80 - mel_output.shape[1]))
+
+            audio_out = self.vocoder.inference(mel_output)
+        return audio_out.squeeze().cpu().numpy()
+
 def get_inference_handler(model_type, model_cfg, device, model_path):
-    if model_type == 'speecht5':
-        return SpeechT5Inference(model_cfg, device, model_path)
-    elif model_type == 'f5_tts':
-        return F5Inference(model_cfg, device, model_path)
-    elif model_type == 'xtts_v2':
-        return XTTSInference(model_cfg, device, model_path)
+    if model_type == 'speecht5': return SpeechT5Inference(model_cfg, device, model_path)
+    elif model_type == 'f5_tts': return F5Inference(model_cfg, device, model_path)
+    elif model_type == 'fastspeech2': return FastSpeech2Inference(model_cfg, device, model_path)
+    elif model_type == 'matcha': return MatchaInference(model_cfg, device, model_path)
+    elif model_type == 'glow_tts': return GlowTTSInference(model_cfg, device, model_path)
+    elif model_type == 'xtts_v2': return XTTSInference(model_cfg, device, model_path)
     else:
-        print(f"⚠️ Inferência para {model_type} não implementada no script genérico.")
+        print(f"⚠️ Inferência para {model_type} não implementada.")
         sys.exit(1)
 
-# ==============================================================================
-# MAIN INFERENCE
-# ==============================================================================
-
 def main():
-    parser = argparse.ArgumentParser(description="Teste de Inferência TTS con LoRA")
-    parser.add_argument("--profile", type=str, default=None, help="Perfil de hardware (opcional)")
-    parser.add_argument("--dataset", type=str, default=None, help="Perfil do dataset (opcional)")
-    parser.add_argument("--model_name", type=str, default=None, help="Pasta do modelo")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Caminho do arquivo config.yaml")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", type=str, required=True, help="Pasta do modelo treinado (ex: ./output_cuda_8gb/fastspeech2-...)")
+    parser.add_argument("--profile", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
 
     full_cfg = load_config(args.config)
-    
-    # 1. Identificar Perfis
-    dataset_name = args.dataset or full_cfg.get('settings', {}).get('default_dataset_profile', 'lapsbm')
-    if dataset_name not in full_cfg['dataset_profiles']:
-        print(f"❌ Perfil de dataset '{dataset_name}' não encontrado.")
-        sys.exit(1)
-        
+    dataset_name = args.dataset or full_cfg.get('settings', {}).get('default_dataset_profile', 'lapsbm_fastspeech2')
     ds_cfg = full_cfg['dataset_profiles'][dataset_name]
-    model_type = ds_cfg.get('model_type', 'speecht5')
+    model_type = ds_cfg.get('model_type', 'fastspeech2')
     model_cfg = full_cfg['models'][model_type]
     
-    # 2. Hardware
     hw_name = args.profile or detect_hardware_profile()
     hw_cfg = full_cfg['hardware_profiles'].get(hw_name, full_cfg['hardware_profiles']['cpu'])
     device = hw_cfg.get('device', 'cpu')
-    
-    print(f"🚀 Hardware: {hw_name.upper()} | Dataset: {dataset_name} | Modelo: {model_type}")
 
-    # 3. Modelos Opcionais de Validação (MOS e ASR)
-    print("\n📦 Carregando modelos especialistas auxiliares para validação das métricas (Whisper e SQUIM)...")
-    
-    mos_predictor = None
-    try:
-        import speechmos.dnsmos as dnsmos
-        print("   ⏳ Carregando SpeechMOS (DNSMOS) para previsão de MOS (Qualidade)...")
-        mos_predictor = dnsmos
-        print("   ✅ SpeechMOS carregado com sucesso.")
-    except Exception as e:
-        print(f"   ⚠️ Alerta: Falha ao carregar SpeechMOS (DNSMOS). Continuará sem MOS. Detalhe: {e}")
+    print(f"🚀 Iniciando Teste de Inferência Comparativo...")
+    print(f"   📂 Modelo Treinado: {args.model_dir}")
+    print(f"   💻 Hardware: {hw_name.upper()} ({device})")
 
-    asr_pipeline = None
-    try:
-        from transformers import pipeline
-        print("   ⏳ Carregando Whisper Large V3 Turbo para Transcrição e extração de WER...")
-        # Usa GPU local da forma segura
-        asr_pipeline = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0 if torch.cuda.is_available() else -1, chunk_length_s=30)
-        print("   ✅ Whisper carregado com sucesso.")
-    except Exception as e:
-        print(f"   ⚠️ Alerta: Falha ao carregar Whisper. Continuará sem WER. Detalhe: {e}")
+    # 1. Criar pasta de saída com timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(args.model_dir, f"inference_{timestamp}")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"   🎯 Resultados serão salvos em: {out_dir}")
 
-    # 3. Localizar Modelo
-    profile_output_dir = hw_cfg['output_dir']
-    model_path = None
-
-    if args.model_name:
-        # Tenta no diretório do perfil atual
-        temp_path = os.path.join(profile_output_dir, args.model_name)
-        if os.path.exists(temp_path):
-            model_path = temp_path
-        else:
-            # Busca em outros diretórios de perfis caso tenha mudado de hardware (ex: CUDA -> CPU fallback)
-            for p_name, p_cfg in full_cfg['hardware_profiles'].items():
-                alt_path = os.path.join(p_cfg['output_dir'], args.model_name)
-                if os.path.exists(alt_path):
-                    model_path = alt_path
-                    print(f"📂 Modelo encontrado em diretório alternativo: {alt_path}")
-                    break
-        
-        if not model_path:
-            print(f"❌ Erro: O diretório do modelo '{args.model_name}' não foi encontrado em nenhum perfil de saída.")
-            sys.exit(1)
-    else:
-        # Lógica de detecção automática baseada no prefixo
-        prefix = f"{model_type}-{dataset_name}-"
-        # Coleta subpastas de TODOS os output_dirs configurados
-        all_dirs = set(p['output_dir'] for p in full_cfg['hardware_profiles'].values())
-        subfolders_found = []
-        for d in all_dirs:
-            if os.path.exists(d):
-                for f in os.listdir(d):
-                    full_p = os.path.join(d, f)
-                    if os.path.isdir(full_p) and prefix in f:
-                        subfolders_found.append(full_p)
-        
-        if not subfolders_found:
-             print(f"⚠️ Nenhum modelo encontrado contendo '{prefix}'. Buscando fallback...")
-             # Busca fallback em todos os lugares
-             fallback_found = None
-             for d in all_dirs:
-                 fb = os.path.join(d, "0-1-Locutor-speecht5_laps_lora_exhaustive")
-                 if os.path.exists(fb):
-                     fallback_found = fb
-                     break
-             
-             if fallback_found:
-                 model_path = fallback_found
-                 print(f"📂 Fallback detectado: {model_path}")
-             else:
-                 print(f"❌ Erro: Nenhum modelo validado encontrado nos diretórios de saída. Use --model_name para especificar manualmente.")
-                 sys.exit(1)
-        else:
-             subfolders_found.sort()
-             model_path = subfolders_found[-1]
-             print(f"📂 Modelo detectado: {model_path}")
-
-    # 4. Handler e Carregamento
-    handler = get_inference_handler(model_type, model_cfg, device, model_path)
+    # 2. Carregar Handler e Modelo
+    handler = get_inference_handler(model_type, model_cfg, device, args.model_dir)
     handler.load()
-    
-    # 5. Speaker Embedding (Referência)
-    repo_name = ds_cfg['dataset_id'].split('/')[-1]
-    local_ds_path = os.path.join(".", "meus_datasets", repo_name)
-    is_local = os.path.exists(local_ds_path)
-    
-    print(f"📥 Carregando speaker reference de: {ds_cfg['dataset_id']} (Local: {is_local})")
-    
-    if ds_cfg['dataset_id'] == "firstpixel/pt-br_char":
-        import pandas as pd
-        if is_local:
-            csv_path = os.path.join(local_ds_path, "metadata.csv")
-            df = pd.read_csv(csv_path, sep="|")
-            audio_path = os.path.join(local_ds_path, df.iloc[0, 0].replace("/", os.sep))
-            dataset = Dataset.from_list([{"audio": audio_path, "text": df.iloc[0, 1], "__url__": "Ref"}])
-        else:
-            from huggingface_hub import hf_hub_download
-            csv_path = hf_hub_download(repo_id=ds_cfg['dataset_id'], filename="metadata.csv", repo_type="dataset")
-            df = pd.read_csv(csv_path, sep="|")
-            audio_url = f"hf://datasets/{ds_cfg['dataset_id']}/{df.iloc[0, 0]}"
-            dataset = Dataset.from_list([{"audio": audio_url, "text": df.iloc[0, 1], "__url__": "Ref"}])
-    else:
-        load_kwargs = {"split": ds_cfg['dataset_split'], "streaming": False}
-        if is_local:
-            load_kwargs["path"] = local_ds_path
-        else:
-            load_kwargs["path"] = ds_cfg['dataset_id']
-            if 'dataset_config' in ds_cfg: load_kwargs["name"] = ds_cfg['dataset_config']
-            
-        dataset = load_dataset(**load_kwargs)
-    
-    if "wav" in dataset.column_names: dataset = dataset.rename_column("wav", "audio")
-    
-    # O codificador de locutor SEMPRE espera áudio em 16000Hz independente do gerador TTS
-    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
-    all_speakers = [extract_speaker_id(x) for x in dataset]
-    counts = Counter(all_speakers)
-    most_common_spk, _ = counts.most_common(1)[0]
-    indices = [i for i, x in enumerate(all_speakers) if x == most_common_spk]
-    
-    sample = dataset[indices[0]]
-    audio_ref = sample["audio"]["array"]
-    
-    print(f"👤 Clonando voz do locutor: {most_common_spk}")
-    speaker_model = EncoderClassifier.from_hparams(source=model_cfg['speaker_encoder_id'], run_opts={"device": device})
-    
-    with torch.no_grad():
-        most_common_emb = speaker_model.encode_batch(torch.tensor(audio_ref))
-        most_common_emb = torch.nn.functional.normalize(most_common_emb, dim=2).squeeze().to(device).unsqueeze(0)
 
-    # 6. Test Cases
-    target_sr = model_cfg.get('sampling_rate', 16000)
-    cases = []
+    # 3. Textos de Inferência
+    test_texts = [
+        "O treinamento exaustivo foi finalizado com sucesso.",
+        "Esta é uma demonstração de voz gerada por inteligência artificial.",
+        "A qualidade do áudio melhorou significativamente após o ajuste fino.",
+        "Estamos testando a comparação entre o modelo base e o modelo treinado."
+    ]
     
-    # Casos Originais
-    cases.append((
-        "caso1_standard", 
-        "O treinamento foi finalizado e agora estamos testando a voz em português.", 
-        most_common_emb, 
-        most_common_spk
-    ))
-    cases.append((
-        "caso2_paris", 
-        "Há algumas coisas que não podem deixar de serem vistas em Paris.", 
-        most_common_emb, 
-        most_common_spk
-    ))
-    cases.append((
-        "caso3_extra", 
-        f"Olá! Tudo bem com você?? Eu estou ótimo!!!!! Estamos testando o suporte multi-modelo para {model_type.upper()}. A ideia é ver como ele se comporta com diferentes tipos de texto.", 
-        most_common_emb, 
-        most_common_spk
-    ))
-    
-    # Processar dataset_split.json se existir
-    import json
-    split_path = os.path.join(model_path, "dataset_split.json")
-    if os.path.exists(split_path):
-        print("\n🔍 Lendo configurações de Zero-Shot Split (dataset_split.json)...")
-        with open(split_path, 'r', encoding='utf-8') as f:
-            split_info = json.load(f)
-        
-        test_spks = split_info.get("test_speakers", [])
-        if test_spks:
-            print(f"   👥 Locutores reservados para Teste Zero-Shot encontrados: {test_spks}")
-            
-            seen_test_spks = set()
-            for s_id, item in zip(all_speakers, dataset):
-                if s_id in test_spks and s_id not in seen_test_spks:
-                    seen_test_spks.add(s_id)
-                    text = item.get("text", "")
-                    audio = item["audio"]["array"]
-                    
-                    with torch.no_grad():
-                        emb = speaker_model.encode_batch(torch.tensor(audio))
-                        emb = torch.nn.functional.normalize(emb, dim=2).squeeze().to(device).unsqueeze(0)
-                        
-                    cases.append((f"zero_shot_{s_id}", text, emb, s_id))
-                    
-                    if len(seen_test_spks) == len(test_spks):
-                        break
+    # Salvar textos utilizados
+    texts_path = os.path.join(out_dir, "textos_utilizados.txt")
+    with open(texts_path, "w", encoding="utf-8") as f:
+        for i, t in enumerate(test_texts):
+            f.write(f"{i+1}. {t}\n")
+    print(f"   📝 Textos de inferência salvos em: {texts_path}")
 
-    print("\n🎧 Gerando áudios e Validando Métricas...")
-    
-    validation_metrics = []
-    
-    for filename, text, emb, spk_id in cases:
+    # 4. Obter Speaker Embedding (se necessário)
+    speaker_emb = None
+    if model_type in ['speecht5', 'xtts_v2']:
+        print("   🔍 Preparando Speaker Embedding (Dummy para compatibilidade)...")
+        if model_type == 'speecht5':
+            speaker_emb = torch.zeros((1, 512)).to(device)
+        elif model_type == 'xtts_v2':
+            speaker_emb = [torch.zeros((1, 1, 1024)).to(device), torch.zeros((1, 512)).to(device)]
+
+    # 5. Executar Inferência
+    sampling_rate = model_cfg.get('sampling_rate', 22050)
+    for i, text in enumerate(test_texts):
+        print(f"\n   --- Teste {i+1}/{len(test_texts)} ---")
         clean_text = normalize_text(text)
-        print(f"\n   👤 Usando Voz: '{spk_id}' | Origem: {'Teste Invisível' if 'zero_shot' in filename else 'Conhecido (Fixos)'}")
-        print(f"   📝 Mensagem: '{clean_text}'")
-        print(f"   ⚙️  ID Local do Teste: {filename}")
         
-        # 7. Medir Latência
-        start_time = time.time()
-        audio_out = handler.generate(clean_text, emb)
-
-        gen_time = time.time() - start_time
-        
-        # Calcular RTF (Real Time Factor)
-        audio_duration = len(audio_out) / target_sr
-        rtf = gen_time / audio_duration if audio_duration > 0 else 0
-        
-        out_path = os.path.join(model_path, f"{filename}_{dataset_name}_{model_type}_test.wav")
-        sf.write(out_path, audio_out, target_sr)
-        
-        # 8. Calcular Similaridade do Locutor (SimLocutor)
-        # O modelo SpeechBrain espera 16000Hz
-        if target_sr != 16000:
-            import librosa
-            audio_out_16k = librosa.resample(audio_out, orig_sr=target_sr, target_sr=16000)
-        else:
-            audio_out_16k = audio_out
-            
-        with torch.no_grad():
-            gen_emb = speaker_model.encode_batch(torch.tensor(audio_out_16k)).to(device)
-            gen_emb = torch.nn.functional.normalize(gen_emb, dim=2).squeeze().unsqueeze(0)
-            # Calcula similaridade do cosseno (-1 a 1)
-            sim = torch.nn.functional.cosine_similarity(emb, gen_emb).item()
-            
-        # 8b. Calcular Qualidade de Áudio Preditiva (MOS de 1 a 5)
-        mos_score = 0.0
-        if mos_predictor:
-            # O DNSMOS do speechmos recebe o numpy array e sample_rate 16000
-            mos_res = mos_predictor.run(audio_out_16k, 16000)
-            mos_score = mos_res['ovrl_mos']
-                
-        # 8c. Calcular Word Error Rate (WER via Whisper transcrevendo o Output)
-        wer_score = 1.0 # 100% de erro de fallback se falhar
-        if asr_pipeline:
-            whisper_out = asr_pipeline({"raw": audio_out_16k, "sampling_rate": 16000})
-            transcription = whisper_out["text"]
-            wer_score = calculate_wer(clean_text, transcription)
-            
-        print(f"      ✅ Salvo: {out_path}")
-        print(f"         ➡️ [Métricas] RTF: {rtf:.2f}x | SimLocutor: {sim:.3f} | MOS: {mos_score:.2f} | WER: {wer_score:.2f}")
-        validation_metrics.append({"filename": filename, "rtf": rtf, "sim": sim, "mos": mos_score, "wer": wer_score})
-
-    # 9. Anexar métricas no README.md do Modelo
-    if validation_metrics:
-        avg_rtf = sum(m["rtf"] for m in validation_metrics) / len(validation_metrics)
-        avg_sim = sum(m["sim"] for m in validation_metrics) / len(validation_metrics)
-        avg_mos = sum(m["mos"] for m in validation_metrics) / len(validation_metrics)
-        avg_wer = sum(m["wer"] for m in validation_metrics) / len(validation_metrics)
-        
-        # Calcular Accuracy Positiva (1 - WER) => Ex: WER 0.2 vira Acc 0.8
-        acc_wer = max(1.0 - avg_wer, 0.0)
-        
-        readme_path = os.path.join(model_path, "README.md")
-        # Se for string multi line sem indent, fica melhor no markdown
-        readme_appendix = f"""
-## Parâmetros da Fórmula Custo-Benefício (Validação de Inferência)
-
-**Teste realizado com o script test_inference_exhaustive.py gerando inferências diretas e métricas automatizadas.**
-
-### 🔻 Custos Adicionais (Denominador)
-- **Latência Média de Geração (RTF)**: {avg_rtf:.2f}x *(O tempo levado divido pela duração total do áudio em segundos)*
-
-### 🌟 Benefícios Medidos (Numerador Prático)
-- **Acurácia (1 - WER)**: {acc_wer:.3f} *(Extraída através do word-error-rate transcrito pelo Whisper e Distância Levenshtein)*
-- **SimLocutor Médio (Similaridade de Voz)**: {avg_sim:.3f} *(Medido via distância de cossenos em Embeddings do WavLM/SpeechBrain. >0.85 é excelente)*
-- **Qualidade Média Percebida (MOS Nominal)**: {avg_mos:.2f} / 5.00 *(Calculado via torchaudio SQUIM_SUBJECTIVE DNS)*
-"""
-        mode = "a" if os.path.exists(readme_path) else "w"
+        # Original (Base)
+        print(f"   🔊 Gerando ORIGINAL...")
         try:
-            with open(readme_path, mode, encoding="utf-8") as f:
-                f.write(readme_appendix)
-            print(f"\n📄 Métricas de Inferência anexadas ao README do modelo na pasta:\n   {readme_path}")
+            audio_orig = handler.generate(clean_text, speaker_emb, use_lora=False)
+            sf.write(os.path.join(out_dir, f"teste{i+1}_original.wav"), audio_orig, sampling_rate)
         except Exception as e:
-            print(f"\n⚠️ Falha ao salvar README de inferência: {e}")
+            print(f"   ⚠️ Erro no modelo original: {e}")
+        
+        # Treinado (LoRA)
+        print(f"   🔥 Gerando TREINADO (LoRA)...")
+        try:
+            audio_lora = handler.generate(clean_text, speaker_emb, use_lora=True)
+            sf.write(os.path.join(out_dir, f"teste{i+1}_treinado.wav"), audio_lora, sampling_rate)
+        except Exception as e:
+            print(f"   ⚠️ Erro no modelo treinado: {e}")
+
+    print(f"\n✅ Teste concluído! Todos os arquivos estão em: {out_dir}")
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,8 @@ output_cuda_8gb/
 output_cpu/
 output_mac/
 meus_datasets/*
+datasets/*
+scratch/
 *.wav
 
 # Editor
