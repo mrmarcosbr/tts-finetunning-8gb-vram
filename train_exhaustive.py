@@ -594,7 +594,10 @@ class FastSpeech2Handler(ModelHandler):
                 def __init__(self, p): self.p = p
                 def phonemize(self, text, separator="", language="pt"):
                     ph = self.p.phonemize(text, separator=separator, language=language)
-                    replacements = {'ẽ': 'e', 'ĩ': 'i', 'õ': 'o', 'ũ': 'u', 'ã': 'a', '\u0303': '', 'g': 'ɡ'}
+                    # Normaliza para decompor acentos (ẽ -> e + ~) e remove a marca de nasalização
+                    import unicodedata
+                    ph = unicodedata.normalize("NFD", ph)
+                    replacements = {'\u0303': '', 'g': 'ɡ'} # Remove til e garante g fonético
                     for k, v in replacements.items(): ph = ph.replace(k, v)
                     return ph
                 def name(self): return "pt_wrapper"
@@ -640,8 +643,13 @@ class FastSpeech2Handler(ModelHandler):
             
             pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=1024, hop_length=256)
             
-        # FastSpeech 2 / FastPitch requer pitch (F0) real durante o treino
+        # FastSpeech 2 / FastPitch requer pitch (F0) real durante o treino.
+        # IMPORTANTE: O modelo original (LJSpeech) usa pitch normalizado. 
+        # Sem normalização, o loss explode para ~40000.
         pitch = np.nan_to_num(pitch)
+        if pitch.any():
+            pitch = (pitch - 200.0) / 50.0 # Normalização básica (Z-Score aproximado)
+            
         if len(pitch) > y_tensor.shape[0]: pitch = pitch[:y_tensor.shape[0]]
         elif len(pitch) < y_tensor.shape[0]: pitch = np.pad(pitch, (0, y_tensor.shape[0] - len(pitch)))
         

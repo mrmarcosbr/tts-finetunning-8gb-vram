@@ -61,16 +61,14 @@ models:
       # Focando nas camadas de atenção, feed-forward, Pitch Predictor e Duration Predictor
       target_modules:
         [
-          "linear_q",
-          "linear_k",
-          "linear_v",
-          "linear_out",
           "conv1",
           "conv2",
           "conv_1",
           "conv_2",
           "proj",
           "pitch_emb",
+          "self_attn",
+          "out_proj",
         ]
 
   matcha:
@@ -131,7 +129,7 @@ dataset_profiles:
       dataloader_num_workers: 4
       num_epochs: 400
       save_steps: 1000
-      logging_steps: 200
+      logging_steps: 50
 
   lapsbm_matcha:
     dataset_id: "falabrasil/lapsbm"
