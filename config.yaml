@@ -114,7 +114,7 @@ dataset_profiles:
       test_speakers: 4
     training:
       learning_rate: 0.0002 # FS2 aceita LR um pouco mais alta que o SpeechT5
-      num_epochs: 300
+      num_epochs: 1000
       save_steps: 500
       logging_steps: 100
 

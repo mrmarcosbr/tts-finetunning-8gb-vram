@@ -1011,7 +1011,8 @@ def main():
         "fp16": hw_cfg['fp16'],
         "dataloader_num_workers": 0,
         "remove_unused_columns": False,
-        "report_to": "none"
+        "report_to": "none",
+        "max_grad_norm": 1000.0 # Permitindo gradientes altos para o Pitch Predictor aprender os Hz brutos
     }
 
     if processed_val_ds:
