@@ -3,20 +3,26 @@
 - Testado com python 3.11.9 (Windows) e 3.12.3 (Linux)
 - Drivers CUDA da NVIDA para rodar pytorch usando a GPU
 
-# Cria enviromment
-- python -m venv venv
-- source venv/bin/activate
+# Cria ambientes com uv
+- Instale o `uv` se ainda não tiver: https://docs.astral.sh/uv/getting-started/installation/
+- `uv venv venv_global`
+- `.\venv_global\Scripts\Activate.ps1`
+- `uv pip install -r requirements.txt --index-strategy unsafe-best-match`
+- Depois de concluir o ambiente global, crie o ambiente do FS2: `uv venv venv_fs2`
+- Para instalar o FS2 sem baixar o torch de novo, use o cache do uv com hardlinks: `uv pip install --python .\venv_fs2 --requirement requirements_fs2.txt --link-mode hardlink --index-strategy unsafe-best-match`
 
 # Instala dependências
-- pip install -r requirements.txt
+- O ambiente `venv_global` passa a conter os pacotes do projeto via `uv`.
+- O ambiente `venv_fs2` recebe as dependências específicas do FastSpeech 2 via `uv`, reaproveitando o cache do `torch` já baixado.
+- Se preferir usar o fluxo do projeto com `pyproject.toml`, `uv sync` também está configurado.
 
 # Token Hugging Face
 - Crie uma conta na Hugging Face - https://huggingface.co/settings/tokens - e gere um Token de Acesso (permissão de leitura) para fazer o Download os Modelos pré-treinados necessários para o fine-tuning e inferência.
 - Configure a variável de ambiente `HF_TOKEN` com o token no arquivo .env ou via terminal/variáveis de ambiente do sistema operacional. 
  
 # Aplicar Patches e Correções Nativas 
-Algumas bibliotecas como SpeechBrain e HuggingFace podem apresentar erros e alertas conflitantes (ex: warnings do `autocast`, bugs de `HF_TOKEN` suprimido e erros falsos 404 HTTP). Para ter um ambiente de console limpo e livre de interrupções falsas, execute os scripts de correção que injetam os reparos diretamente na sua subpasta `venv` recém instalada (somente depois de já ter instalado os pacotes com pip install):
-- python apply_patches_no_warnings.py
+Algumas bibliotecas como SpeechBrain e HuggingFace podem apresentar erros e alertas conflitantes (ex: warnings do `autocast`, bugs de `HF_TOKEN` suprimido e erros falsos 404 HTTP). Para ter um ambiente de console limpo e livre de interrupções falsas, execute os scripts de correção que injetam os reparos diretamente na sua subpasta `venv_global` recém instalada (somente depois de já ter instalado os pacotes com `uv pip install`):
+- `python apply_patches_no_warnings.py`
 
 # Trabalhando com Datasets Offline (Opcional)
 Se você deseja garantir os gigantescos arquivos de áudio protegidos na sua máquina de forma permanente e sem depender da internet no momento do treinamento (ou pra se proteger caso deletem a base pública original da HuggingFace), os componentes do repositório contam com "interceptação automática offline".
@@ -33,10 +39,10 @@ Verificar o arquivo config.yaml que contem as configurações de treinamento par
 
 # Treina Modelo (Fine Tunning)
 Usando Detecção Automática de Hardware: 
-- python train_exhaustive.py 
+- `python train_exhaustive.py` 
 
 Usando profile específico (ex: "cuda_16gb" ou "macbook" ou "cpu"):
-- python train_exhaustive.py --profile "macbook"
+- `python train_exhaustive.py --profile "macbook"`
 
 Realiza o treinamento de modelo existente em inglês com novos áudios transcritos em português. O objetivo deste fine tunning é permitir que um modelo construído puramente para responder audios em inglês, consigo também responder em português.
 
@@ -46,7 +52,7 @@ Realiza o treinamento de modelo existente em inglês com novos áudios transcrit
 
 # Realiza Inferência (Converte texto em português para Áudio com o Modelo retreinado)
 Usando Detecção Automática de Hardware: 
-- python test_inference_exhaustive.py
+- `python test_inference_exhaustive.py`
 
 Usando profile específico e modelo específico
-- python train_exhaustive.py --profile "cuda_16gb" --model_name "SpeechT5-2026-03-30-23-33-05"
+- `python train_exhaustive.py --profile "cuda_16gb" --model_name "SpeechT5-2026-03-30-23-33-05"`

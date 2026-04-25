@@ -1,11 +1,20 @@
 import os
 import sys
 import time
+import warnings
 from datetime import datetime
 from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente (HF_TOKEN)
 load_dotenv()
+
+# Evita spam de warning conhecido do SpeechBrain/Torchaudio durante o treino.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchaudio\._backend\.list_audio_backends has been deprecated.*",
+    category=UserWarning,
+)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,6 +101,25 @@ def detect_hardware_profile(full_cfg):
     
     print("   ⚠️ Nenhuma GPU de alta performance detectada. Usando CPU.")
     return "cpu"
+
+
+class FS2DataCollator:
+    """Collator em escopo de módulo para suportar DataLoader multiprocess no Windows."""
+    def __call__(self, features):
+        from torch.nn.utils.rnn import pad_sequence
+        x = pad_sequence([f["x"] for f in features], batch_first=True)
+        y = pad_sequence([f["y"] for f in features], batch_first=True)
+        pitch = pad_sequence([f["pitch"].squeeze(0) for f in features], batch_first=True).unsqueeze(1)
+        x_lengths = torch.stack([f["x_lengths"] for f in features])
+        y_lengths = torch.stack([f["y_lengths"] for f in features])
+
+        return {
+            "x": x,
+            "x_lengths": x_lengths,
+            "y": y,
+            "y_lengths": y_lengths,
+            "pitch": pitch
+        }
 
 # ==============================================================================
 # MODEL HANDLERS (Um para cada arquitetura)
@@ -501,6 +529,14 @@ class FastSpeech2Handler(ModelHandler):
         config = FastSpeech2Config()
         config.load_json(config_path)
         
+        # Inicializa o AudioProcessor da Coqui
+        try:
+            from TTS.utils.audio import AudioProcessor
+            self.ap = AudioProcessor(**config.audio)
+        except Exception as e:
+            print(f"⚠️ Aviso: Falha ao iniciar AudioProcessor da Coqui. Erro: {e}")
+            self.ap = None
+            
         self.model_fs2 = FastSpeech2.init_from_config(config)
         self.model_fs2.load_checkpoint(config, checkpoint_path=model_path)
         
@@ -584,43 +620,40 @@ class FastSpeech2Handler(ModelHandler):
         
         # Extração de Mel
         import librosa
-        mel_spec = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0
-        )
-        log_mel = np.log10(np.clip(mel_spec, 1e-5, None))
-        
+        if hasattr(self, "ap") and self.ap is not None:
+            if sr != self.ap.sample_rate:
+                y = librosa.resample(y, orig_sr=sr, target_sr=self.ap.sample_rate)
+                sr = self.ap.sample_rate
+            mel_spec = self.ap.melspectrogram(y)
+            y_tensor = torch.tensor(mel_spec.T)
+            # Para pitch, vamos usar librosa com os parametros do ap
+            pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=self.ap.win_length or 1024, hop_length=self.ap.hop_length or 256)
+        else:
+            if sr != 22050:
+                y = librosa.resample(y, orig_sr=sr, target_sr=22050)
+                sr = 22050
+            mel_spec = librosa.feature.melspectrogram(
+                y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0
+            )
+            log_mel = np.log10(np.clip(mel_spec, 1e-5, None))
+            y_tensor = torch.tensor(log_mel.T) # Coqui espera [B, T, C]
+            
+            pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=1024, hop_length=256)
+            
         # FastSpeech 2 / FastPitch requer pitch (F0) real durante o treino
-        pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=1024, hop_length=256)
         pitch = np.nan_to_num(pitch)
-        if len(pitch) > log_mel.shape[1]: pitch = pitch[:log_mel.shape[1]]
-        elif len(pitch) < log_mel.shape[1]: pitch = np.pad(pitch, (0, log_mel.shape[1] - len(pitch)))
+        if len(pitch) > y_tensor.shape[0]: pitch = pitch[:y_tensor.shape[0]]
+        elif len(pitch) < y_tensor.shape[0]: pitch = np.pad(pitch, (0, y_tensor.shape[0] - len(pitch)))
         
         return {
             "x": torch.tensor(input_ids),
             "x_lengths": torch.tensor(len(input_ids)),
-            "y": torch.tensor(log_mel.T), # Coqui espera [B, T, C]
-            "y_lengths": torch.tensor(log_mel.shape[1]),
+            "y": y_tensor.float(),
+            "y_lengths": torch.tensor(y_tensor.shape[0]),
             "pitch": torch.tensor(pitch).unsqueeze(0).float() # [1, T]
         }
 
     def get_collator(self):
-        @dataclass
-        class FS2DataCollator:
-            def __call__(self, features):
-                from torch.nn.utils.rnn import pad_sequence
-                x = pad_sequence([f["x"] for f in features], batch_first=True)
-                y = pad_sequence([f["y"] for f in features], batch_first=True)
-                pitch = pad_sequence([f["pitch"].squeeze(0) for f in features], batch_first=True).unsqueeze(1)
-                x_lengths = torch.stack([f["x_lengths"] for f in features])
-                y_lengths = torch.stack([f["y_lengths"] for f in features])
-                
-                return {
-                    "x": x,
-                    "x_lengths": x_lengths,
-                    "y": y,
-                    "y_lengths": y_lengths,
-                    "pitch": pitch
-                }
         return FS2DataCollator()
 
 class MatchaWrapper(torch.nn.Module):
@@ -770,6 +803,48 @@ class ValidationCallback(TrainerCallback):
                 else:
                     print(f"   {name}: {value}")
             print("--------------------------------------------------\n")
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+class TrainingETACallback(TrainerCallback):
+    """Mostra ETA estimado a partir do progresso real do treino."""
+
+    def __init__(self):
+        self.start_time = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.perf_counter()
+
+    def _print_eta(self, prefix, state):
+        if not self.start_time or not state.max_steps or state.global_step <= 0:
+            return
+
+        elapsed = time.perf_counter() - self.start_time
+        avg_step = elapsed / max(state.global_step, 1)
+        remaining_steps = max(state.max_steps - state.global_step, 0)
+        remaining_seconds = remaining_steps * avg_step
+
+        print(
+            f"⏳ [{prefix}] Passo {state.global_step}/{state.max_steps} | "
+            f"Média: {avg_step:.2f}s/step | ETA: {format_duration(remaining_seconds)}"
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and ("loss" in logs or "eval_loss" in logs):
+            self._print_eta("ETA", state)
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        self._print_eta("ETA/VAL", state)
 
 def main():
     parser = argparse.ArgumentParser(description="Treinamento TTS Generalizado con LoRA")
@@ -996,11 +1071,15 @@ def main():
 
     # 7. Training
     train_params = ds_cfg['training']
+    effective_batch_size = train_params.get('batch_size', hw_cfg['batch_size'])
+    effective_grad_acc = train_params.get('gradient_accumulation_steps', hw_cfg['gradient_accumulation_steps'])
+    effective_num_workers = train_params.get('dataloader_num_workers', 0)
+    is_windows = os.name == "nt"
     
     training_kwargs = {
         "output_dir": out_dir,
-        "per_device_train_batch_size": hw_cfg['batch_size'],
-        "gradient_accumulation_steps": hw_cfg['gradient_accumulation_steps'],
+        "per_device_train_batch_size": effective_batch_size,
+        "gradient_accumulation_steps": effective_grad_acc,
         "learning_rate": train_params['learning_rate'], 
         "num_train_epochs": train_params['num_epochs'],
         "logging_steps": train_params['logging_steps'],
@@ -1009,11 +1088,17 @@ def main():
         "save_total_limit": 1,
         "weight_decay": train_params.get('weight_decay', 0.0),
         "fp16": hw_cfg['fp16'],
-        "dataloader_num_workers": 0,
+        "dataloader_num_workers": effective_num_workers,
         "remove_unused_columns": False,
         "report_to": "none",
         "max_grad_norm": 1000.0 # Permitindo gradientes altos para o Pitch Predictor aprender os Hz brutos
     }
+
+    # Ajuste de comportamento por sistema operacional.
+    # No Linux, workers persistentes tendem a melhorar o throughput de input pipeline.
+    # No Windows, manter desabilitado evita arestas com spawn em alguns cenários.
+    if effective_num_workers > 0:
+        training_kwargs["dataloader_persistent_workers"] = not is_windows
 
     if processed_val_ds:
         training_kwargs["eval_strategy"] = "steps"
@@ -1027,7 +1112,7 @@ def main():
         "train_dataset": processed_train_ds, 
         "eval_dataset": processed_val_ds, # Habilitando validação
         "data_collator": handler.get_collator(),
-        "callbacks": [ValidationCallback()] # Adicionando callback customizado
+        "callbacks": [TrainingETACallback(), ValidationCallback()] # ETA + callback customizado
     }
     
     if processed_val_ds:
@@ -1065,9 +1150,17 @@ def main():
     # 8. Saving Final Model
     print("\n💾 Salvando modelo final...")
     try:
+        saved = False
         if hasattr(model, "save_pretrained"):
             model.save_pretrained(out_dir)
-        else:
+            saved = True
+        elif hasattr(model, "model") and hasattr(model.model, "save_pretrained"):
+            # Caso de wrappers (ex: FastSpeech2Wrapper) que encapsulam um PeftModel.
+            # Isso garante adapter_config.json + adapter_model.safetensors para inferência limpa.
+            model.model.save_pretrained(out_dir)
+            saved = True
+
+        if not saved:
             trainer.save_model(out_dir)
             
         if hasattr(processor, "save_pretrained"):

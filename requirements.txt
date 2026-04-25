@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu129
+--extra-index-url https://download.pytorch.org/whl/cu128
 
 accelerate==1.13.0
 aiohappyeyeballs==2.6.1
@@ -71,8 +71,8 @@ speechbrain==1.0.3
 sympy==1.14.0
 threadpoolctl==3.6.0
 tokenizers==0.22.2
-torch==2.8.0+cu129
-torchaudio==2.8.0+cu129
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
 tqdm==4.67.3
 transformers==5.3.0
 typer==0.24.1

@@ -1,10 +1,10 @@
 # Dependências para Matcha-TTS com LoRA
 # Use: python -m venv venv_matcha && source venv_matcha/bin/activate && pip install -r requirements_matcha.txt
 
---extra-index-url https://download.pytorch.org/whl/cu129
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.8.0+cu129
-torchaudio==2.8.0+cu129
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
 transformers>=4.40.0
 peft>=0.10.0
 datasets<4.0.0

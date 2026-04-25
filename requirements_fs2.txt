@@ -1,10 +1,10 @@
 # Dependências para FastSpeech 2 com LoRA
-# Use: python -m venv venv_fs2 && source venv_fs2/bin/activate && pip install -r requirements_fs2.txt
+# Use: uv venv venv_fs2 && uv pip install --python .\venv_fs2 --requirement requirements_fs2.txt --link-mode hardlink --index-strategy unsafe-best-match
 
---extra-index-url https://download.pytorch.org/whl/cu129
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.8.0+cu129
-torchaudio==2.8.0+cu129
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
 transformers<4.45.0
 peft>=0.10.0
 datasets<4.0.0
@@ -17,3 +17,4 @@ python-dotenv
 soundfile
 tqdm
 speechbrain
+gruut-lang-pt
