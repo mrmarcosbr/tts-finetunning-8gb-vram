@@ -14,7 +14,14 @@ venv_fs2/
 # Checkpoints / Datasets / Output
 speecht5_laps_lora_exhaustive/
 output_cuda_16gb/
-output_cuda_8gb/
+output_cuda_8gb*/
+Treinamento LoRA*
+*.html
+*.txt
+!requirements*.txt
+!README.md
+!valores_referencia_treinamento.txt
+
 output_cpu/
 output_mac/
 meus_datasets/*

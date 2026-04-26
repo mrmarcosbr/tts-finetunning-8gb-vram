@@ -57,6 +57,26 @@ def calculate_wer(reference_text, hypothesis_text):
                 d[i][j] = min(d[i - 1][j - 1], d[i][j - 1], d[i - 1][j]) + 1
                 
     return float(d[len(ref_words)][len(hyp_words)]) / len(ref_words)
+    
+def find_checkpoint(model_path):
+    """Detecta se há subpastas de checkpoint e retorna a mais recente."""
+    if not os.path.isdir(model_path):
+        return model_path
+    
+    checkpoints = [d for d in os.listdir(model_path) 
+                   if d.startswith("checkpoint-") and os.path.isdir(os.path.join(model_path, d))]
+    
+    if not checkpoints:
+        return model_path
+        
+    # Ordenar por número do passo (checkpoint-1000, checkpoint-2000, etc)
+    try:
+        checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+        latest = checkpoints[-1]
+        print(f"   🔄 Checkpoint detectado automaticamente: {latest}")
+        return os.path.join(model_path, latest)
+    except:
+        return model_path
 
 
 def load_config(config_path="config.yaml"):
@@ -236,11 +256,16 @@ class FastSpeech2Inference(InferenceHandler):
         
         # Tentar carregar o checkpoint base antes de aplicar o Peft
         if os.path.exists(model_file):
+            print(f"   基础 (Base) model weights: {model_file}")
             base_model.load_checkpoint(config, checkpoint_path=model_file)
             
+        # 🔍 Lógica de Detecção de Checkpoint
+        actual_model_path = find_checkpoint(self.model_path)
+
         # Carregar LoRA (tentando PeftModel.from_pretrained primeiro, depois fallback manual)
-        if os.path.exists(os.path.join(self.model_path, "adapter_config.json")):
-            self.model = PeftModel.from_pretrained(base_model, self.model_path)
+        if os.path.exists(os.path.join(actual_model_path, "adapter_config.json")):
+            print(f"   ✅ Carregando adaptadores LoRA via PEFT de {actual_model_path}")
+            self.model = PeftModel.from_pretrained(base_model, actual_model_path)
         else:
             print("   ⚠️ adapter_config.json não encontrado. Tentando reconstrução manual do LoRA...")
             from peft import LoraConfig, get_peft_model
@@ -252,20 +277,40 @@ class FastSpeech2Inference(InferenceHandler):
             )
             self.model = get_peft_model(base_model, peft_config)
             
-            # Carregar pesos do state_dict (com correção de prefixo se necessário)
-            safetensors_path = os.path.join(self.model_path, "model.safetensors")
-            if os.path.exists(safetensors_path):
-                from safetensors.torch import load_file
-                state_dict = load_file(safetensors_path)
+            # Carregar pesos do state_dict (Safetensors ou PyTorch Bin)
+            weights_file = None
+            for wf in ["model.safetensors", "pytorch_model.bin", "adapter_model.bin"]:
+                if os.path.exists(os.path.join(actual_model_path, wf)):
+                    weights_file = os.path.join(actual_model_path, wf)
+                    break
+            
+            if weights_file:
+                print(f"   📥 Carregando pesos de: {os.path.basename(weights_file)}")
+                if weights_file.endswith(".safetensors"):
+                    from safetensors.torch import load_file
+                    state_dict = load_file(weights_file)
+                else:
+                    state_dict = torch.load(weights_file, map_location=self.device)
+                
+                # Limpeza cirúrgica de prefixos
                 new_state_dict = {}
                 for k, v in state_dict.items():
-                    # Remove prefixo 'model.' adicionado pelo Wrapper do FastSpeech2 durante o treino
-                    if k.startswith("model."):
-                        new_state_dict[k[6:]] = v
-                    else:
-                        new_state_dict[k] = v
-                self.model.load_state_dict(new_state_dict, strict=False)
-                print(f"   ✅ Pesos carregados de {os.path.basename(safetensors_path)}")
+                    name = k
+                    # O Trainer salva com 'model.base_model.model...', 
+                    # o PeftModel espera 'base_model.model...'
+                    if name.startswith("model.base_model.model."): 
+                        name = name[6:] # Remove apenas o primeiro 'model.'
+                    new_state_dict[name] = v
+                
+                # Carregar pesos no PeftModel
+                missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
+                loaded_keys = len(new_state_dict) - len(unexpected)
+                print(f"   ✨ Sucesso: {loaded_keys} tensores carregados (LoRA + Base).")
+                if unexpected:
+                    print(f"   ℹ️ {len(unexpected)} chaves ignoradas (provavelmente optimizers ou metadados).")
+            else:
+                print(f"   ❌ ERRO: Nenhum arquivo de pesos encontrado em {actual_model_path}")
+                print(f"      Arquivos presentes: {os.listdir(actual_model_path)}")
 
         self.model.to(self.device).eval()
         
@@ -308,7 +353,11 @@ class FastSpeech2Inference(InferenceHandler):
                 def __init__(self, p): self.p = p
                 def phonemize(self, text, separator="", language="pt"):
                     ph = self.p.phonemize(text, separator=separator, language=language)
-                    replacements = {'ẽ': 'e', 'ĩ': 'i', 'õ': 'o', 'ũ': 'u', 'ã': 'a', '\u0303': '', 'g': 'ɡ'}
+                    # Mapeamento de Precisão (Vogal + n) usando 'ɐ' para o som de 'ã' fechado.
+                    replacements = {
+                        'ã': 'ɐn', 'ẽ': 'en', 'ĩ': 'in', 'õ': 'on', 'ũ': 'un',
+                        '\u0303': 'n', 'g': 'ɡ'
+                    }
                     for k, v in replacements.items(): ph = ph.replace(k, v)
                     return ph
                 def name(self): return "pt_wrapper"
@@ -325,7 +374,7 @@ class FastSpeech2Inference(InferenceHandler):
         input_ids = torch.tensor([self.tokenizer.text_to_ids(text, language="pt")]).to(self.device)
         with torch.no_grad():
             if use_lora:
-                outputs = self.model.inference(input_ids)
+                outputs = self.model.inference(input_ids, aux_input={"durations": None, "pitch": None, "energy": None, "length_scale": 1.0})
             else:
                 with self.model.disable_adapter():
                     outputs = self.model.inference(input_ids)
@@ -333,15 +382,23 @@ class FastSpeech2Inference(InferenceHandler):
             
             # Ajustar dimensões para o vocoder (espera [B, C, T])
             if mel_output.ndim == 3:
-                # Se for [B, T, C], transpõe para [B, C, T]
                 if mel_output.shape[2] == 80 or mel_output.shape[2] == 90:
                     mel_output = mel_output.transpose(1, 2)
             
-            # Garantir 80 canais (caso o modelo tenha retornado algo diferente, ex: 90)
+            # Garantir 80 canais
             if mel_output.shape[1] > 80:
                 mel_output = mel_output[:, :80, :]
             elif mel_output.shape[1] < 80:
                 mel_output = torch.nn.functional.pad(mel_output, (0, 0, 0, 80 - mel_output.shape[1]))
+
+            # --- CORREÇÃO DE ESCALA PARA O VOCODER ---
+            # Converte de [-4, 4] para [-100, 0]
+            min_level_db = -100
+            max_norm = 4.0
+            mel_norm = (mel_output / max_norm + 1) / 2.0
+            mel_raw = mel_norm * (-min_level_db) + min_level_db
+            mel_output = mel_raw.clamp(min_level_db, 0)
+            # -----------------------------------------
 
             audio_out = self.vocoder.inference(mel_output)
         return audio_out.squeeze().cpu().numpy()
@@ -448,7 +505,8 @@ def get_inference_handler(model_type, model_cfg, device, model_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=str, required=True, help="Pasta do modelo treinado (ex: ./output_cuda_8gb/fastspeech2-...)")
+    parser.add_argument("--model_path", "--model_dir", type=str, required=True, help="Pasta do modelo treinado (ex: ./output_cuda_8gb/fastspeech2-...)")
+    parser.add_argument("--text", type=str, default=None, help="Texto customizado para gerar áudio")
     parser.add_argument("--profile", type=str, default=None)
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--config", type=str, default="config.yaml")
@@ -464,67 +522,75 @@ def main():
     hw_cfg = full_cfg['hardware_profiles'].get(hw_name, full_cfg['hardware_profiles']['cpu'])
     device = hw_cfg.get('device', 'cpu')
 
-    print(f"🚀 Iniciando Teste de Inferência Comparativo...")
-    print(f"   📂 Modelo Treinado: {args.model_dir}")
+    # Ajuste para aceitar o caminho do checkpoint diretamente ou a pasta pai
+    model_path = args.model_path
+
+    print(f"🚀 Iniciando Teste de Inferência...")
+    print(f"   📂 Modelo: {model_path}")
     print(f"   💻 Hardware: {hw_name.upper()} ({device})")
 
-    # 1. Criar pasta de saída com timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(args.model_dir, f"inference_{timestamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"   🎯 Resultados serão salvos em: {out_dir}")
-
-    # 2. Carregar Handler e Modelo
-    handler = get_inference_handler(model_type, model_cfg, device, args.model_dir)
+    # 1. Carregar Handler e Modelo
+    handler = get_inference_handler(model_type, model_cfg, device, model_path)
     handler.load()
 
-    # 3. Textos de Inferência
-    test_texts = [
+    sampling_rate = model_cfg.get('sampling_rate', 22050)
+    
+    # 2. Obter Speaker Embedding (se necessário)
+    speaker_emb = None
+    if model_type in ['speecht5', 'xtts_v2']:
+        if model_type == 'speecht5':
+            speaker_emb = torch.zeros((1, 512)).to(device)
+        elif model_type == 'xtts_v2':
+            speaker_emb = [torch.zeros((1, 1, 1024)).to(device), torch.zeros((1, 512)).to(device)]
+
+    # 3. Preparar lista de textos
+    default_texts = [
         "O treinamento exaustivo foi finalizado com sucesso.",
         "Esta é uma demonstração de voz gerada por inteligência artificial.",
         "A qualidade do áudio melhorou significativamente após o ajuste fino.",
         "Estamos testando a comparação entre o modelo base e o modelo treinado."
     ]
     
-    # Salvar textos utilizados
-    texts_path = os.path.join(out_dir, "textos_utilizados.txt")
-    with open(texts_path, "w", encoding="utf-8") as f:
-        for i, t in enumerate(test_texts):
-            f.write(f"{i+1}. {t}\n")
-    print(f"   📝 Textos de inferência salvos em: {texts_path}")
+    test_texts = []
+    if args.text:
+        test_texts.append(args.text)
+    test_texts.extend(default_texts)
 
-    # 4. Obter Speaker Embedding (se necessário)
-    speaker_emb = None
-    if model_type in ['speecht5', 'xtts_v2']:
-        print("   🔍 Preparando Speaker Embedding (Dummy para compatibilidade)...")
-        if model_type == 'speecht5':
-            speaker_emb = torch.zeros((1, 512)).to(device)
-        elif model_type == 'xtts_v2':
-            speaker_emb = [torch.zeros((1, 1, 1024)).to(device), torch.zeros((1, 512)).to(device)]
+    # 4. Criar pasta de saída
+    type_str = "custom" if args.text else "batch"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(model_path, f"inference_{type_str}_{timestamp}")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    print(f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças...")
+    print(f"   🎯 Resultados em: {out_dir}")
 
     # 5. Executar Inferência
-    sampling_rate = model_cfg.get('sampling_rate', 22050)
     for i, text in enumerate(test_texts):
         print(f"\n   --- Teste {i+1}/{len(test_texts)} ---")
         clean_text = normalize_text(text)
+        prefix = "custom" if (args.text and i == 0) else f"sentenca_{i+1}"
         
         # Original (Base)
         print(f"   🔊 Gerando ORIGINAL...")
         try:
             audio_orig = handler.generate(clean_text, speaker_emb, use_lora=False)
-            sf.write(os.path.join(out_dir, f"teste{i+1}_original.wav"), audio_orig, sampling_rate)
+            sf.write(os.path.join(out_dir, f"{prefix}_original.wav"), audio_orig, sampling_rate)
         except Exception as e:
             print(f"   ⚠️ Erro no modelo original: {e}")
-        
+
         # Treinado (LoRA)
         print(f"   🔥 Gerando TREINADO (LoRA)...")
         try:
             audio_lora = handler.generate(clean_text, speaker_emb, use_lora=True)
-            sf.write(os.path.join(out_dir, f"teste{i+1}_treinado.wav"), audio_lora, sampling_rate)
+            sf.write(os.path.join(out_dir, f"{prefix}_treinado.wav"), audio_lora, sampling_rate)
+            # Se for a frase customizada, salvar também na raiz para facilitar
+            if args.text and i == 0:
+                sf.write("output_inference.wav", audio_lora, sampling_rate)
         except Exception as e:
             print(f"   ⚠️ Erro no modelo treinado: {e}")
-
-    print(f"\n✅ Teste concluído! Todos os arquivos estão em: {out_dir}")
+            
+    print(f"\n✅ Concluído! Todos os arquivos estão na pasta: {out_dir}")
 
 if __name__ == "__main__":
     main()

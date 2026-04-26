@@ -1,0 +1,7 @@
+f0_rmse_hz	15.0 - 18.0 Hz
+mel_loss	0.35 - 0.45
+duration_loss	< 0.10
+pitch_loss	< 0.50
+aligner_sharpness	< 0.10
+grad_norm	0.5 - 1.5 (Estável)
+

@@ -42,6 +42,13 @@ def main():
     except Exception as e:
         print(f"Erro ao aplicar patch_init: {e}")
 
+    # 5. Patch do PEFT (AttributeError torch.distributed.tensor no Torch 2.8+)
+    try:
+        import patch_peft
+        patch_peft.apply_patch(venv_dir)
+    except Exception as e:
+        print(f"Erro ao aplicar patch_peft: {e}")
+
     print("=== Concluído! Todos os patches foram injetados no ambiente atual com sucesso. ===")
 
 

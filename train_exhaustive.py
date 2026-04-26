@@ -49,6 +49,37 @@ from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, Tr
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
 
+class LogMetricsCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None and "loss" in logs:
+            model = kwargs.get("model")
+            
+            # Tentar encontrar as métricas no modelo (pode estar dentro de um wrapper)
+            m = model
+            if hasattr(m, "module"): m = m.module
+            
+            if hasattr(m, "last_metrics"):
+                # Mapeamento de possíveis nomes de chaves do Coqui
+                key_map = {
+                    "f0_rmse_hz": "f0_rmse_hz",
+                    "pitch_loss": ["pitch_loss", "loss_pitch", "pitch"],
+                    "duration_loss": ["loss_dur", "duration_loss", "loss_duration"],
+                    "mel_loss": ["loss_spec", "mel_loss", "loss_mel"],
+                    "aligner_sharpness": ["loss_binary_alignment", "loss_aligner", "binary_loss"]
+                }
+                
+                for display_name, possible_keys in key_map.items():
+                    if isinstance(possible_keys, str):
+                        if possible_keys in m.last_metrics:
+                            val = m.last_metrics[possible_keys]
+                            logs[display_name] = round(float(val.detach() if hasattr(val, 'detach') else val), 4)
+                    else:
+                        for pk in possible_keys:
+                            if pk in m.last_metrics:
+                                val = m.last_metrics[pk]
+                                logs[display_name] = round(float(val.detach() if hasattr(val, 'detach') else val), 4)
+                                break
+
 # Configuração de encoding para Windows
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -73,13 +104,23 @@ def extract_speaker_id(item):
     ]
     
     for p in possible_paths:
-        if p and "LapsBM-" in str(p):
-            # Ex: foo/bar/LapsBM-M-001.wav -> LapsBM-M-001.wav -> M-001
-            filename = os.path.basename(str(p))
+        p_str = str(p)
+        if not p_str: continue
+        
+        # Padrão LapsBM-M-001 ou LapsBM-F-001
+        if "LapsBM-" in p_str:
+            filename = os.path.basename(p_str)
             if filename.startswith("LapsBM-"):
                 return filename.split(".")[0].replace("LapsBM-", "")
-                
-    return "unknown"
+        
+        # Padrão de pastas lapsbm/M-001/... ou lapsbm/f001/...
+        parts = p_str.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            folder = parts[-2]
+            if folder.lower() != "audio" and len(folder) > 1:
+                return folder
+
+    return "default"
 
 def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -448,9 +489,10 @@ class XTTSHandler(ModelHandler):
         return XTTSDataCollator()
 
 class FastSpeech2Wrapper(torch.nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, device):
         super().__init__()
         self.model = model
+        self.device = device
         
         # Recuperar a função de loss oficial do Coqui para treinar Pitch/Duration/Energy
         base_model = getattr(self.model, "base_model", self.model)
@@ -494,13 +536,30 @@ class FastSpeech2Wrapper(torch.nn.Module):
                 alignment_logprob=outputs.get("alignment_logprob", None),
                 alignment_soft=outputs["alignment_soft"],
                 alignment_hard=outputs["alignment_mas"],
-                binary_loss_weight=0.0
+                binary_loss_weight=1.0 # Crucial para o Aligner convergir! Estava em 0.0, impedindo o aprendizado de duração.
             )
             
-            # A loss total já vem calculada e agregada dentro do dict pela Coqui
-            total_loss = loss_dict["loss"]
+            # Depuração: imprimir as chaves na primeira vez para sabermos os nomes exatos
+            if not hasattr(self, "_keys_printed"):
+                keys = list(loss_dict.keys())
+                print(f"\n🔍 [DEBUG] Métricas detectadas no Coqui: {keys}")
+                self._keys_printed = True
+
+            # Calcular F0 RMSE em Hz para monitoramento humano
+            p_key = next((k for k in loss_dict.keys() if "pitch" in k), None)
+            if p_key:
+                pitch_mse = loss_dict[p_key].item()
+                f0_rmse_hz = 50.0 * (pitch_mse ** 0.5)
+                loss_dict["f0_rmse_hz"] = f0_rmse_hz
             
-        return {"loss": total_loss, "model_outputs": outputs["model_outputs"]}
+            # Salvar no modelo para o Callback de log acessar
+            # Adicionando explicitamente o aligner_loss para monitoramento de nitidez
+            if "binary_loss" in loss_dict:
+                loss_dict["aligner_sharpness"] = loss_dict["binary_loss"]
+                
+            self.last_metrics = loss_dict
+
+            return {"loss": loss_dict["loss"], "model_outputs": outputs["model_outputs"]}
 
 class FastSpeech2Handler(ModelHandler):
     def load(self, resume_from=None):
@@ -508,6 +567,7 @@ class FastSpeech2Handler(ModelHandler):
             from TTS.utils.manage import ModelManager
             from TTS.tts.models.forward_tts import ForwardTTS as FastSpeech2
             from TTS.tts.configs.fastspeech2_config import Fastspeech2Config as FastSpeech2Config
+            from TTS.utils.audio import AudioProcessor
             from peft import get_peft_model, LoraConfig, PeftModel
         except ImportError:
             print("❌ Erro: Biblioteca 'TTS' (Coqui) não encontrada no .venv_fs2.")
@@ -529,23 +589,26 @@ class FastSpeech2Handler(ModelHandler):
         config = FastSpeech2Config()
         config.load_json(config_path)
         
-        # Inicializa o AudioProcessor da Coqui
-        try:
-            from TTS.utils.audio import AudioProcessor
-            self.ap = AudioProcessor(**config.audio)
-        except Exception as e:
-            print(f"⚠️ Aviso: Falha ao iniciar AudioProcessor da Coqui. Erro: {e}")
-            self.ap = None
-            
+        # Inicializar o AudioProcessor oficial com a config do modelo
+        self.ap = AudioProcessor.init_from_config(config)
+        
+        # Ajuste de segurança para detecção de Pitch (F0)
+        # Valores abaixo de 50 Hz causam erro no librosa.pyin com janelas de 1024
+        self.ap.pitch_fmin = 50
+        self.ap.pitch_fmax = 1000
+        
         self.model_fs2 = FastSpeech2.init_from_config(config)
-        self.model_fs2.load_checkpoint(config, checkpoint_path=model_path)
+        self.model_fs2.load_checkpoint(config, checkpoint_path=os.path.join(model_dir, "model.pth"))
         
         # Aplicar LoRA ou Carregar existente
         lora_cfg = self.model_cfg['lora']
         peft_config = LoraConfig(
-            r=lora_cfg['r'], lora_alpha=lora_cfg['alpha'], 
-            target_modules=lora_cfg['target_modules'], lora_dropout=lora_cfg['dropout'], 
-            bias="none"
+            r=lora_cfg['r'],
+            lora_alpha=lora_cfg['alpha'],
+            target_modules=lora_cfg['target_modules'],
+            lora_dropout=lora_cfg['dropout'],
+            bias="none",
+            task_type=None
         )
 
         if resume_from and (os.path.exists(os.path.join(resume_from, "adapter_config.json")) or os.path.exists(os.path.join(resume_from, "model.safetensors"))):
@@ -582,7 +645,7 @@ class FastSpeech2Handler(ModelHandler):
             
         print(f"✅ LoRA aplicado ao FastSpeech 2.")
         
-        self.model = FastSpeech2Wrapper(self.model_fs2)
+        self.model = FastSpeech2Wrapper(self.model_fs2, self.device)
         
         # Substituir o fonemizador original pelo de português (Gruut)
         try:
@@ -594,10 +657,11 @@ class FastSpeech2Handler(ModelHandler):
                 def __init__(self, p): self.p = p
                 def phonemize(self, text, separator="", language="pt"):
                     ph = self.p.phonemize(text, separator=separator, language=language)
-                    # Normaliza para decompor acentos (ẽ -> e + ~) e remove a marca de nasalização
-                    import unicodedata
-                    ph = unicodedata.normalize("NFD", ph)
-                    replacements = {'\u0303': '', 'g': 'ɡ'} # Remove til e garante g fonético
+                    # Mapeamento de Precisão: Usamos 'ɐ' (presente no vocab base) para o 'a' fechado/nasal.
+                    replacements = {
+                        'ã': 'ɐn', 'ẽ': 'en', 'ĩ': 'in', 'õ': 'on', 'ũ': 'un',
+                        '\u0303': 'n', 'g': 'ɡ'
+                    }
                     for k, v in replacements.items(): ph = ph.replace(k, v)
                     return ph
                 def name(self): return "pt_wrapper"
@@ -621,34 +685,24 @@ class FastSpeech2Handler(ModelHandler):
         # Tokenização (FS2 usa fonemas internamente via tokenizer)
         input_ids = processor.text_to_ids(text, language=language)
         
-        # Extração de Mel
+        # Extração de Mel e Pitch usando o AudioProcessor (garante escalas corretas)
         import librosa
-        if hasattr(self, "ap") and self.ap is not None:
-            if sr != self.ap.sample_rate:
-                y = librosa.resample(y, orig_sr=sr, target_sr=self.ap.sample_rate)
-                sr = self.ap.sample_rate
-            mel_spec = self.ap.melspectrogram(y)
-            y_tensor = torch.tensor(mel_spec.T)
-            # Para pitch, vamos usar librosa com os parametros do ap
-            pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=self.ap.win_length or 1024, hop_length=self.ap.hop_length or 256)
-        else:
-            if sr != 22050:
-                y = librosa.resample(y, orig_sr=sr, target_sr=22050)
-                sr = 22050
-            mel_spec = librosa.feature.melspectrogram(
-                y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=80, fmin=0.0, fmax=8000.0
-            )
-            log_mel = np.log10(np.clip(mel_spec, 1e-5, None))
-            y_tensor = torch.tensor(log_mel.T) # Coqui espera [B, T, C]
+        if sr != self.ap.sample_rate:
+            y = librosa.resample(y, orig_sr=sr, target_sr=self.ap.sample_rate)
+            sr = self.ap.sample_rate
             
-            pitch, _, _ = librosa.pyin(y, fmin=65, fmax=2000, sr=sr, frame_length=1024, hop_length=256)
-            
-        # FastSpeech 2 / FastPitch requer pitch (F0) real durante o treino.
-        # IMPORTANTE: O modelo original (LJSpeech) usa pitch normalizado. 
-        # Sem normalização, o loss explode para ~40000.
+        # O melspectrogram do AP já aplica log e normalização (symmetric se configurado)
+        mel_spec = self.ap.melspectrogram(y) 
+        y_tensor = torch.tensor(mel_spec.T) # [T, C]
+        
+        # Extração de Pitch (F0)
+        pitch = self.ap.compute_f0(y)
         pitch = np.nan_to_num(pitch)
+        
+        # Normalização de Pitch (padrão do Coqui para FastPitch)
         if pitch.any():
-            pitch = (pitch - 200.0) / 50.0 # Normalização básica (Z-Score aproximado)
+            pitch = np.log(np.clip(pitch, 1.0, None) + 1.0)
+            pitch = (pitch - 5.0) / 0.5 
             
         if len(pitch) > y_tensor.shape[0]: pitch = pitch[:y_tensor.shape[0]]
         elif len(pitch) < y_tensor.shape[0]: pitch = np.pad(pitch, (0, y_tensor.shape[0] - len(pitch)))
@@ -771,7 +825,7 @@ class GlowTTSHandler(FastSpeech2Handler):
             if not p.is_contiguous(): p.data = p.data.contiguous()
             
         self.model_glow.to(self.device)
-        self.model = FastSpeech2Wrapper(self.model_glow) # Reutiliza wrapper de loss
+        self.model = FastSpeech2Wrapper(self.model_glow, self.device) # Reutiliza wrapper de loss
         return self.model, self.model_glow.tokenizer
 
 class GenericSOTAHandler(ModelHandler):
@@ -1094,12 +1148,13 @@ def main():
         "save_strategy": "steps",
         "save_steps": train_params['save_steps'], # Salvando a cada 10 épocas (aprox. 1750 passos com batch 4)
         "save_total_limit": 1,
+        "save_safetensors": False,
         "weight_decay": train_params.get('weight_decay', 0.0),
         "fp16": hw_cfg['fp16'],
         "dataloader_num_workers": effective_num_workers,
         "remove_unused_columns": False,
         "report_to": "none",
-        "max_grad_norm": 1000.0 # Permitindo gradientes altos para o Pitch Predictor aprender os Hz brutos
+        "max_grad_norm": 5.0 # Estabilizando gradientes para evitar saltos bruscos na Loss
     }
 
     # Ajuste de comportamento por sistema operacional.
@@ -1126,8 +1181,12 @@ def main():
     if processed_val_ds:
         trainer_kwargs["eval_dataset"] = processed_val_ds
 
+    trainer_kwargs["callbacks"].append(LogMetricsCallback())
     trainer = Trainer(**trainer_kwargs)
     
+    # Configurar logging para incluir métricas customizadas como f0_rmse_hz
+    trainer.label_names = ["labels"] # Garante que o trainer aceite o dict de loss customizado
+
     print("\n🏁 Iniciando Treinamento...")
     if args.resume_from:
         print(f"🔄 Retomando treinamento a partir de: {args.resume_from}")

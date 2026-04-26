@@ -53,22 +53,49 @@ models:
 
   fastspeech2:
     id: "tts_models/en/ljspeech/fast_pitch"
+    model_type: "fastspeech2"
     sampling_rate: 22050
     lora:
-      r: 256
-      alpha: 512
-      dropout: 0.0
-      # Focando nas camadas de atenção, feed-forward, Pitch Predictor e Duration Predictor
+      r: 32         
+      alpha: 32
+      dropout: 0.05
+      # --- MAPA DE MÓDULOS PARA O LORA ---
+      # Encoder (Cérebro Fonético)
+      #   - "encoder.*attention.(query|key|value)"
+      #   - "encoder.*attention.out_proj"
+      #   - "encoder.*conv1"
+      #   - "encoder.*conv2"
+      #
+      # Decoder (Voz/Timbre)
+      #   - "decoder.*attention.(query|key|value)"
+      #   - "decoder.*conv1"
+      #   - "decoder.*conv2"
+      #
+      # Predictores (Melhora Ritmo/Entonação)
+      #   - "duration_predictor.conv_1"
+      #   - "duration_predictor.conv_2"
+      #   - "duration_predictor.proj"
+      #   - "pitch_predictor.conv_1"
+      #   - "pitch_predictor.conv_2"
+      #   - "pitch_predictor.proj"
+      #
+      # Alinhador (Sincronia Fina)
+      #   - "aligner.conv1"
+      #   - "aligner.conv2"
+      # ----------------------------------
       target_modules:
         [
+          "embedding",          # Camada de entrada (crucial para novos fonemas)
+          "query_projection",
+          "key_projection",
+          "value_projection",
+          "out_projection",
           "conv1",
           "conv2",
-          "conv_1",
-          "conv_2",
-          "proj",
-          "pitch_emb",
-          "self_attn",
-          "out_proj",
+          # Preditores de Duração (Ritmo)
+          "duration_predictor.conv_1",
+          "duration_predictor.conv_2",
+          "duration_predictor.proj",
         ]
 
   matcha:
@@ -123,12 +150,12 @@ dataset_profiles:
       val_speakers: 3
       test_speakers: 4
     training:
-      learning_rate: 0.0002 # FS2 aceita LR um pouco mais alta que o SpeechT5
-      batch_size: 48
-      gradient_accumulation_steps: 1
+      learning_rate: 0.00005 # Reduzido para 5e-5 conforme sugestão técnica do Claude
+      batch_size: 16
+      gradient_accumulation_steps: 8 # Mantendo lote total virtual de 128 (16 * 8)
       dataloader_num_workers: 4
-      num_epochs: 400
-      save_steps: 1000
+      num_epochs: 1500
+      save_steps: 500
       logging_steps: 50
 
   lapsbm_matcha:
