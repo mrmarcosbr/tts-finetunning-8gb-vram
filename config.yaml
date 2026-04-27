@@ -1,7 +1,7 @@
 # CONFIGURAÇÕES GERAIS
 # ==============================================================================
 settings:
-  default_dataset_profile: "lapsbm_fastspeech2"
+  default_dataset_profile: "lapsbm_speecht5"
   local_datasets_dir: "./datasets"
 
 # ==============================================================================
@@ -18,15 +18,33 @@ hardware_profiles:
   cuda_8gb:
     device: "cuda"
     batch_size: 4
-    fp16: true # Crucial para economizar VRAM
+    fp16: true
+    bf16: false
+    gradient_checkpointing: false
     gradient_accumulation_steps: 4 # Total batch virtual = 16
     output_dir: "./output_cuda_8gb"
 
   cuda_16gb:
     device: "cuda"
-    batch_size: 20
-    fp16: true
-    gradient_accumulation_steps: 1
+    # Menos acumulação (4 vs 8) = menos micro-passos/optimizer, mesmo lote global ~128
+    batch_size: 64
+    gradient_accumulation_steps: 2
+    # RTX 30/40/50+: bf16 em geral sólido; com fp16=false. Dataset pode sobrepor com training.bf16: false
+    bf16: false
+    fp16: false
+    # Só true após testes; o Trainer reencaminha p/ o wrapper (e ao Peft se existir) — Coqui puro pode ignorar
+    gradient_checkpointing: false
+    output_dir: "./output_cuda_16gb"
+
+  # Lote global 128 = mesma escala que cuda_16gb (64×2 / 8×16 / 32×4). 32×4: menos acum. que 8×16, micro-batch ainda abaixo de 64.
+  # Uso: python train_exhaustive.py --profile cuda_16gb_speecht5
+  cuda_16gb_speecht5:
+    device: "cuda"
+    batch_size: 32
+    gradient_accumulation_steps: 4
+    bf16: false
+    fp16: false
+    gradient_checkpointing: false
     output_dir: "./output_cuda_16gb"
 
   macbook:
@@ -55,9 +73,14 @@ models:
     id: "tts_models/en/ljspeech/fast_pitch"
     model_type: "fastspeech2"
     sampling_rate: 22050
+    # 0 = sem gradiente no ramo de pitch. ~0,08–0,12 = bom equilíbrio F0 vs resto; >0,15 pode instabilizar cedo.
+    pitch_loss_alpha: 0.1
+    # F0: o checkpoint LJS (config.json) não traz pitch_mean/pitch_std; o pré-treino usou z-score de corpus (F0Dataset).
+    # "zscore" = mean/std do teu f0_stats (padrão). "raw_hz" = experimental (diverge do LJS se não ajustar).
+    f0_input_mode: "zscore"
     lora:
-      r: 32         
-      alpha: 32
+      r: 64
+      alpha: 128
       dropout: 0.05
       # --- MAPA DE MÓDULOS PARA O LORA ---
       # Encoder (Cérebro Fonético)
@@ -85,7 +108,7 @@ models:
       # ----------------------------------
       target_modules:
         [
-          "embedding",          # Camada de entrada (crucial para novos fonemas)
+          "embedding", # Camada de entrada (crucial para novos fonemas)
           "query_projection",
           "key_projection",
           "value_projection",
@@ -96,6 +119,9 @@ models:
           "duration_predictor.conv_1",
           "duration_predictor.conv_2",
           "duration_predictor.proj",
+          "pitch_predictor.conv_1",
+          "pitch_predictor.conv_2",
+          "pitch_predictor.proj",
         ]
 
   matcha:
@@ -133,12 +159,16 @@ dataset_profiles:
       val_speakers: 3
       test_speakers: 4
     training:
+      # SpeechT5: com GPU ~16GB use --profile cuda_16gb_speecht5 (evita micro-batch 64 do cuda_16gb). Com ~8GB: --profile cuda_8gb.
+      # Com --profile, batch/grad_acc vêm do hardware (ver hardware_profiles). Sem --profile, podes pôr batch_size e gradient_accumulation_steps aqui.
       learning_rate: 0.00001
       num_epochs: 2500
       weight_decay: 0.0
       save_steps: 500
       logging_steps: 50
+      save_total_limit: 0
 
+  # GPU 8GB: use --profile cuda_8gb (sobrescreve batch/grad do hardware). O default abaixo mira 12–16GB.
   lapsbm_fastspeech2:
     dataset_id: "falabrasil/lapsbm"
     dataset_split: "test"
@@ -150,13 +180,31 @@ dataset_profiles:
       val_speakers: 3
       test_speakers: 4
     training:
-      learning_rate: 0.00005 # Reduzido para 5e-5 conforme sugestão técnica do Claude
-      batch_size: 16
-      gradient_accumulation_steps: 8 # Mantendo lote total virtual de 128 (16 * 8)
+      # Run 10k passos do zero: max_steps tem prioridade sobre num_epochs no HuggingFace Trainer.
+      max_steps: 10000
+      learning_rate: 0.00004 # ligeiramente mais suave com pitch_loss_alpha 0.1 (reduz picos no MAS/F0)
+      # 32x4=128: menos passos de grad accumulation que 16x8 (acelera o step). Reduzir batch se OOM.
+      batch_size: 32
+      gradient_accumulation_steps: 4
+      # No Windows, muitos workers + spawn piora; 4 costuma bater com 8. +workers não acelera se CPU for gargalo.
       dataloader_num_workers: 4
-      num_epochs: 1500
-      save_steps: 500
-      logging_steps: 50
+      num_epochs: 2500
+      save_steps: 1000
+      # null/omit/0: conservar todos os checkpoint-*; inteiro N>0: manter só os N mais recentes
+      # save_total_limit: 3
+      logging_steps: 100
+      # null = a cada save_steps; inteiro = override
+      eval_steps: null
+      # 0 = desligado. Sofretensão: ~1500–3000 dá tempo ao MAS/align antes do binário a 1.0, ajudando o ramo de pitch a não brigar
+      binary_align_warmup_steps: 2000
+      # warmup de LR; depois coseno (longos runs)
+      warmup_ratio: 0.05
+      lr_scheduler_type: "cosine"
+      # null = herdar fp16/bf16 do hardware_profiles; true/false força (ex.: desligar bf16 noutra GPU)
+      fp16: null
+      bf16: null
+      # prefetch por worker (1–4); 2 = default razoável
+      dataloader_prefetch_factor: 2
 
   lapsbm_matcha:
     dataset_id: "falabrasil/lapsbm"

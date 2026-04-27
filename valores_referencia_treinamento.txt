@@ -1,7 +1,25 @@
-f0_rmse_hz	15.0 - 18.0 Hz
-mel_loss	0.35 - 0.45
-duration_loss	< 0.10
-pitch_loss	< 0.50
-aligner_sharpness	< 0.10
-grad_norm	0.5 - 1.5 (Estável)
+# FastPitch + LoRA, LapsBM, F0 em z-score (f0zscore_v1), pitch_loss_alpha = 0
+# Os números "ideais" dependem de schedule, tamanho do dataset e de voice mismatch (EN->PT);
+# abaixo: faixas saudáveis / alvo aproximado, não requisitos de paper.
 
+# Treino sadio (a comparar com passos 500–2000+ e com eval no fim)
+loss              ~7.0 – 10.0   (total Coqui: spec+dur+aligner+binário+…; início 12–15 é normal)
+grad_norm         0.3 – 1.5     (estável, sem sinais de explosão; alerta se >3–5 sustentado)
+learning_rate     (segue o schedule; pico comum 4e-5 a 5e-5, depois desce até ~0)
+epoch             cumprir o plano (ex. várias "épocas" de 560 amostras / batch efetivo 128)
+mel_loss          0.6 – 1.0     muito bom em fine-tune; 1.0 – 1.3 ainda plausível no início
+                  (valores 0.35 – 0.45 são típicos de treino *do zero* em LJS, não deste setup)
+duration_loss     0.15 – 0.35  bom; 0.35 – 0.55 ainda ajustável; <0.10 é raro em LoRA+multilocutor
+                  é a perda (Coqui) entre duração prevista e a dada pelo aligner no *treino* — não "erro em segundos".
+                  Se o áudio na inferência sair curto (~1s), o mais comum é o duration predictor ainda
+                  puxar p/ escalas estilo LJS *ou* muitas posições a ficarem no mínimo (1 frame) — procura
+                  o print 📐 (mel_frames) no teste de inferência; ajuste experimental: --length_scale 1.1–1.3
+f0_rmse_hz        40 – 80 Hz   razoável (variância por batch; com α_f0≈0,1 a loss de *pitch* empurra a predição; ignorar
+                  guias apertados antes de ~2–3k *steps* em run do zero)
+                  25 – 45 Hz  seria muito bom se se mantiver no eval; 15 – 20 Hz = expectativa irrealista para este fine-tune
+                  Com **pitch_loss_alpha** > 0, este RMSE costuma **descer** mais cedo do que com α=0.
+aligner_sharpness ~2.0 – 2.6   alinhada ao teu log (NÃO usar <0.1; outra escala/versão)
+                  tendência a *descer* ligeiramente com treino é positiva, desde que áudio/align não degradem
+
+# pitch_loss: com pitch_loss_alpha = 0 não há otimização de pitch por loss; ignorar alvo de pitch_loss
+# (se voltares a α>0, aí compara pitch_mse / pitch_rmse_zscore nos runs.)

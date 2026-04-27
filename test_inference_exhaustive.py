@@ -2,17 +2,25 @@ import os
 import sys
 sys.modules['torchcodec'] = None # Mock para evitar crash do torchaudio e do transformers no Windows
 
+import importlib
 import time
+import random
 import yaml
 import torch
 import torchaudio
+
+try:
+    importlib.import_module("torch.distributed.tensor")
+except ImportError:
+    pass
 import unicodedata
 import argparse
 import soundfile as sf
+import librosa
 import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import Dict
+from typing import Dict, List, Optional
 
 # Carregar variáveis de ambiente (HF_TOKEN)
 load_dotenv()
@@ -21,7 +29,7 @@ load_dotenv()
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 
-from datasets import load_dataset, Audio, Dataset
+from datasets import load_dataset, Audio, Dataset, load_from_disk
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
 from peft import PeftModel
 from speechbrain.inference.speaker import EncoderClassifier
@@ -36,6 +44,153 @@ def normalize_text(text):
     text = text.lower() # Converter para minúsculo para bater com vocabulário
     return ''.join(c for c in unicodedata.normalize('NFD', text)
                    if unicodedata.category(c) != 'Mn')
+
+# Alvo de pico ao gravar WAV (evita clipping comum em vocoder / SpeechT5)
+INFERENCE_PEAK_TARGET = 0.95
+
+def peak_normalize_audio(audio, peak_target: float = INFERENCE_PEAK_TARGET):
+    """Escala o sinal para que max(|x|) == peak_target (mono float)."""
+    x = np.asarray(audio, dtype=np.float64).reshape(-1)
+    peak = float(np.max(np.abs(x))) if x.size else 0.0
+    if peak <= 1e-12:
+        return np.asarray(audio, dtype=np.float32).reshape(-1)
+    return (x * (peak_target / peak)).astype(np.float32)
+
+def attenuate_low_frequencies(
+    audio,
+    sr: int,
+    cutoff_hz: float = 120.0,
+    attenuation_db: float = 1.2,
+    transition_hz: float = 120.0,
+):
+    """Atenua graves de forma suave via curva no domínio da frequência."""
+    x = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if x.size == 0 or sr <= 0:
+        return x
+
+    min_cutoff = 40.0
+    max_cutoff = max(min_cutoff, (sr * 0.5) - 200.0)
+    cutoff = float(np.clip(cutoff_hz, min_cutoff, max_cutoff))
+    transition = max(20.0, float(transition_hz))
+    low_gain = 10.0 ** (-max(0.0, float(attenuation_db)) / 20.0)
+
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / sr)
+    gains = np.ones_like(freqs, dtype=np.float32)
+
+    low_mask = freqs <= cutoff
+    trans_mask = (freqs > cutoff) & (freqs < cutoff + transition)
+
+    gains[low_mask] = low_gain
+    if np.any(trans_mask):
+        t = (freqs[trans_mask] - cutoff) / transition
+        gains[trans_mask] = low_gain + (1.0 - low_gain) * t
+
+    filtered = np.fft.irfft(spec * gains, n=x.size)
+    return np.asarray(filtered, dtype=np.float32)
+
+def split_text_for_tts(text: str, max_chars: int = 180) -> List[str]:
+    """Divide textos longos em partes menores preservando pontuação quando possível."""
+    clean = (text or "").strip()
+    if not clean:
+        return []
+    if len(clean) <= max_chars:
+        return [clean]
+
+    separators = [". ", "? ", "! ", "; ", ", "]
+    chunks = [clean]
+    for sep in separators:
+        next_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= max_chars:
+                next_chunks.append(chunk)
+                continue
+            parts = [p.strip() for p in chunk.split(sep) if p.strip()]
+            if len(parts) == 1:
+                next_chunks.append(chunk)
+                continue
+            for idx, part in enumerate(parts):
+                if idx < len(parts) - 1 and not part.endswith(tuple(".!?;,:")):
+                    part = part + sep.strip()
+                next_chunks.append(part)
+        chunks = next_chunks
+
+    final_chunks = []
+    buffer = ""
+    for chunk in chunks:
+        candidate = chunk if not buffer else f"{buffer} {chunk}".strip()
+        if len(candidate) <= max_chars:
+            buffer = candidate
+        else:
+            if buffer:
+                final_chunks.append(buffer)
+            buffer = chunk
+    if buffer:
+        final_chunks.append(buffer)
+
+    return final_chunks if final_chunks else [clean]
+
+def compress_audio_silence(
+    audio,
+    sr: int,
+    top_db: float = 35.0,
+    min_gap_ms: int = 90,
+):
+    """Remove silêncios longos no áudio, preservando pequenas pausas naturais."""
+    x = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if x.size == 0 or sr <= 0:
+        return x
+
+    try:
+        intervals = librosa.effects.split(x, top_db=top_db)
+    except Exception:
+        return x
+
+    if intervals.size == 0:
+        return np.asarray([], dtype=np.float32)
+
+    gap = np.zeros(int(sr * (min_gap_ms / 1000.0)), dtype=np.float32)
+    pieces = []
+    for idx, (start, end) in enumerate(intervals):
+        piece = x[start:end]
+        if piece.size == 0:
+            continue
+        pieces.append(piece)
+        if idx < len(intervals) - 1 and gap.size > 0:
+            pieces.append(gap)
+
+    if not pieces:
+        return np.asarray([], dtype=np.float32)
+
+    return np.concatenate(pieces).astype(np.float32)
+
+def trim_and_compress_silence(audio, sr: int, top_db: float = 35.0):
+    """Tira silêncio das bordas e comprime silêncios longos internos."""
+    x = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if x.size == 0 or sr <= 0:
+        return x
+    try:
+        trimmed, _ = librosa.effects.trim(x, top_db=top_db)
+    except Exception:
+        trimmed = x
+    return compress_audio_silence(trimmed, sr, top_db=top_db, min_gap_ms=90)
+
+def write_inference_sentences_txt(out_dir: str, texts: List[str]) -> None:
+    path = os.path.join(out_dir, "sentencas.txt")
+    lines = [
+        "Sentenças usadas nesta inferência",
+        "(entrada do modelo = texto normalizado: minúsculas, sem acentos)",
+        "",
+    ]
+    for i, raw in enumerate(texts, 1):
+        clean = normalize_text(raw)
+        lines.append(f"{i}. Texto bruto:")
+        lines.append(f"   {raw}")
+        lines.append(f"   Normalizado (TTS):")
+        lines.append(f"   {clean}")
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
 
 def calculate_wer(reference_text, hypothesis_text):
     import re
@@ -104,6 +259,187 @@ def extract_speaker_id(item):
             return str(item[k])
     return "unknown"
 
+def _pick_text_from_item(item: Dict) -> str:
+    for key in ["text", "txt", "sentence", "transcription"]:
+        val = item.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+def _merge_unique_texts(*groups: List[str]) -> List[str]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for text in group:
+            raw = (text or "").strip()
+            if not raw:
+                continue
+            # Deduplicar por versão normalizada evita frases iguais com acentuação/pontuação diferente.
+            key = normalize_text(raw)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(raw)
+    return merged
+
+def _random_pick_texts(texts: List[str], limit: int, seed: Optional[int] = None) -> List[str]:
+    clean_unique = _merge_unique_texts(texts)
+    if limit <= 0 or not clean_unique:
+        return []
+    if len(clean_unique) <= limit:
+        return clean_unique
+    if seed is None:
+        return random.SystemRandom().sample(clean_unique, limit)
+    return random.Random(seed).sample(clean_unique, limit)
+
+def load_test_sentences_from_exported_split(
+    full_cfg: Dict,
+    dataset_name: str,
+    limit: int = 10,
+    seed: Optional[int] = None,
+) -> List[str]:
+    local_root = full_cfg.get("settings", {}).get("local_datasets_dir", "./datasets")
+    exported_path = os.path.join(local_root, "test_split_inferencia", dataset_name, "hf_test_split")
+
+    if not os.path.exists(exported_path):
+        return []
+
+    try:
+        ds = load_from_disk(exported_path)
+    except Exception as e:
+        print(f"⚠️ Não foi possível abrir split exportado de teste em '{exported_path}': {e}")
+        return []
+
+    all_texts = []
+    for item in ds:
+        txt = _pick_text_from_item(item)
+        if txt:
+            all_texts.append(txt)
+
+    chosen = _random_pick_texts(all_texts, limit, seed=seed)
+    print(
+        f"   🎲 Sentenças de teste (split exportado) selecionadas: {len(chosen)} "
+        f"(fonte: {exported_path} | alvo: {limit}" +
+        (f" | seed: {seed})" if seed is not None else ")")
+    )
+    return chosen
+
+def load_test_sentences_from_dataset(
+    full_cfg: Dict,
+    ds_cfg: Dict,
+    dataset_name: str,
+    limit: int = 10,
+    seed: Optional[int] = None,
+) -> List[str]:
+    exported = load_test_sentences_from_exported_split(full_cfg, dataset_name, limit=limit, seed=seed)
+    if exported:
+        return exported
+
+    dataset_id = ds_cfg.get("dataset_id")
+    if not dataset_id:
+        return []
+
+    local_root = full_cfg.get("settings", {}).get("local_datasets_dir", "./datasets")
+    repo_name = dataset_id.split("/")[-1]
+    local_ds_path = os.path.join(local_root, repo_name)
+    is_local = os.path.exists(local_ds_path) and bool(os.listdir(local_ds_path)) if os.path.exists(local_ds_path) else False
+
+    print(f"📥 Carregando textos de teste do dataset '{dataset_id}' (Local: {is_local})...")
+
+    all_data = []
+    try:
+        if dataset_id == "firstpixel/pt-br_char":
+            import pandas as pd
+            from huggingface_hub import hf_hub_download
+
+            if is_local:
+                csv_path = os.path.join(local_ds_path, "metadata.csv")
+            else:
+                csv_path = hf_hub_download(repo_id=dataset_id, filename="metadata.csv", repo_type="dataset")
+
+            df = pd.read_csv(csv_path, sep="|")
+            for _, row in df.iterrows():
+                all_data.append({"text": str(row.iloc[1]), "speaker_id": "default"})
+        else:
+            load_kwargs = {"split": ds_cfg.get("dataset_split", "train")}
+            if is_local:
+                dataset_obj = load_from_disk(local_ds_path)
+                if isinstance(dataset_obj, dict):
+                    split_name = ds_cfg.get("dataset_split", "train")
+                    dataset_stream = dataset_obj.get(split_name) or next(iter(dataset_obj.values()))
+                else:
+                    dataset_stream = dataset_obj
+            else:
+                load_kwargs["path"] = dataset_id
+                load_kwargs["streaming"] = ds_cfg.get("streaming", True)
+                if "dataset_config" in ds_cfg:
+                    load_kwargs["name"] = ds_cfg["dataset_config"]
+                dataset_stream = load_dataset(**load_kwargs)
+
+            for item in dataset_stream:
+                if "wav" in item and "audio" not in item:
+                    item["audio"] = item["wav"]
+                if "txt" in item and "text" not in item:
+                    item["text"] = item["txt"]
+                all_data.append(item)
+    except Exception as e:
+        print(f"⚠️ Não foi possível carregar textos do dataset para inferência: {e}")
+        return []
+
+    if not all_data:
+        print("⚠️ Dataset sem amostras para extrair sentenças de teste.")
+        return []
+
+    all_speakers = [extract_speaker_id(x) for x in all_data]
+    counts = Counter(all_speakers)
+    num_spk = ds_cfg.get("num_speakers", 1)
+    max_samples = ds_cfg.get("num_samples_per_speaker", 0)
+    zero_shot_split = ds_cfg.get("zero_shot_split", None)
+
+    if num_spk == 0:
+        valid_spks = set(all_speakers)
+    else:
+        valid_spks = set(s for s, _ in counts.most_common(num_spk))
+
+    train_spks, val_spks, test_spks = valid_spks, set(), set()
+    if zero_shot_split and len(valid_spks) > 0:
+        t_spk = zero_shot_split.get("train_speakers", 28)
+        v_spk = zero_shot_split.get("val_speakers", 3)
+        ts_spk = zero_shot_split.get("test_speakers", 4)
+
+        sorted_spks = sorted(list(valid_spks))
+        if len(sorted_spks) >= (t_spk + v_spk + ts_spk):
+            train_spks = set(sorted_spks[:t_spk])
+            val_spks = set(sorted_spks[t_spk:t_spk + v_spk])
+            test_spks = set(sorted_spks[t_spk + v_spk:t_spk + v_spk + ts_spk])
+            valid_spks = train_spks | val_spks | test_spks
+        else:
+            print("⚠️ Poucos locutores para 80/10/10; sem split de teste dedicado.")
+
+    test_indices = []
+    spk_added_counts = {s: 0 for s in valid_spks}
+    for i, (_, s) in enumerate(zip(all_data, all_speakers)):
+        if s in valid_spks and (max_samples == 0 or spk_added_counts[s] < max_samples):
+            if s in test_spks:
+                test_indices.append(i)
+            spk_added_counts[s] += 1
+
+    all_test_texts = []
+    for idx in test_indices:
+        txt = _pick_text_from_item(all_data[idx])
+        if not txt:
+            continue
+        all_test_texts.append(txt)
+
+    texts = _random_pick_texts(all_test_texts, limit, seed=seed)
+
+    print(
+        f"   🧪 Sentenças da base de teste selecionadas: {len(texts)} "
+        f"(locutores teste: {len(test_spks)} | alvo: {limit}" +
+        (f" | seed: {seed})" if seed is not None else ")")
+    )
+    return texts
+
 # ==============================================================================
 # INFERENCE HANDLERS
 # ==============================================================================
@@ -124,25 +460,54 @@ class InferenceHandler:
 
 class SpeechT5Inference(InferenceHandler):
     def load(self):
-        print(f"📥 Carregando SpeechT5 (Base + LoRA) de: {self.model_path}")
-        self.processor = SpeechT5Processor.from_pretrained(self.model_path)
+        actual = find_checkpoint(self.model_path)
+        print(f"📥 Carregando SpeechT5 (Base + LoRA) de: {self.model_path}" + (f" → {actual}" if actual != self.model_path else ""))
+        self.processor = None
+        for p in (self.model_path, actual):
+            if os.path.isdir(p):
+                try:
+                    self.processor = SpeechT5Processor.from_pretrained(p)
+                    break
+                except OSError:
+                    pass
+        if self.processor is None:
+            self.processor = SpeechT5Processor.from_pretrained(self.model_cfg["id"])
         self.vocoder = SpeechT5HifiGan.from_pretrained(self.model_cfg['vocoder_id']).to(self.device)
         
         base_model = SpeechT5ForTextToSpeech.from_pretrained(self.model_cfg['id'])
-        self.model = PeftModel.from_pretrained(base_model, self.model_path)
+        self.model = PeftModel.from_pretrained(base_model, actual)
         self.model.to(self.device)
         self.model.eval()
 
-    def generate(self, text, speaker_emb, use_lora=True):
-        inputs = self.processor(text=text, return_tensors="pt")
-        with torch.no_grad():
-            if use_lora:
-                spec = self.model.generate(input_ids=inputs["input_ids"].to(self.device), speaker_embeddings=speaker_emb)
-            else:
-                with self.model.disable_adapter():
-                    spec = self.model.generate(input_ids=inputs["input_ids"].to(self.device), speaker_embeddings=speaker_emb)
-            audio_out = self.vocoder(spec)
-        return audio_out.squeeze().cpu().numpy()
+    def generate(self, text, speaker_emb, use_lora=True, **kwargs):
+        chunks = split_text_for_tts(text, max_chars=180)
+        chunk_audio = []
+        chunk_silence = np.zeros(int(self.model_cfg.get("sampling_rate", 16000) * 0.12), dtype=np.float32)
+
+        for idx, chunk in enumerate(chunks):
+            print(f"   (SpeechT5) Parte {idx + 1}/{len(chunks)}: {chunk[:45]}...")
+            inputs = self.processor(text=chunk, return_tensors="pt")
+            with torch.no_grad():
+                if use_lora:
+                    spec = self.model.generate(
+                        input_ids=inputs["input_ids"].to(self.device),
+                        speaker_embeddings=speaker_emb,
+                    )
+                else:
+                    with self.model.disable_adapter():
+                        spec = self.model.generate(
+                            input_ids=inputs["input_ids"].to(self.device),
+                            speaker_embeddings=speaker_emb,
+                        )
+                audio_piece = self.vocoder(spec).squeeze().cpu().numpy().reshape(-1).astype(np.float32)
+            chunk_audio.append(audio_piece)
+            if idx < len(chunks) - 1:
+                chunk_audio.append(chunk_silence)
+
+        if not chunk_audio:
+            return np.asarray([], dtype=np.float32)
+
+        return np.concatenate(chunk_audio)
 
 class F5Inference(InferenceHandler):
     def load(self):
@@ -168,7 +533,7 @@ class F5Inference(InferenceHandler):
         # CFM sampler
         self.cfm = CFM(transformer=self.model, sigma=0.0).to(self.device)
 
-    def generate(self, text, speaker_emb, use_lora=True):
+    def generate(self, text, speaker_emb, use_lora=True, **kwargs):
         print(f"   (F5-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         text_ids = torch.tensor([self.tokenizer.encode(text)]).to(self.device)
         with torch.no_grad():
@@ -197,7 +562,7 @@ class XTTSInference(InferenceHandler):
         self.xtts.gpt = self.model # Substitui o gpt pelo PeftModel
         self.xtts.to(self.device).eval()
 
-    def generate(self, text, speaker_emb, use_lora=True):
+    def generate(self, text, speaker_emb, use_lora=True, **kwargs):
         print(f"   (XTTS v2) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         with torch.no_grad():
             if use_lora:
@@ -227,9 +592,20 @@ class FastSpeech2Inference(InferenceHandler):
             from TTS.tts.models.forward_tts import ForwardTTS as FastSpeech2
             from TTS.tts.configs.fastspeech2_config import Fastspeech2Config as FastSpeech2Config
             from TTS.vocoder.models.gan import GAN as HifiGan
+            from TTS.utils.audio import AudioProcessor
         except ImportError:
             print("❌ Erro: Requer 'pip install coqui-tts'")
             sys.exit(1)
+
+        mp = os.path.abspath(os.path.normpath(self.model_path))
+        if not os.path.exists(mp):
+            print(
+                f"❌ Caminho do modelo/checkpoint inexistente:\n   {mp}\n"
+                "   Use a pasta *real* do run (ex. output_cuda_16gb\\fastspeech2-lapsbm_fastspeech2-AAAA-MM-DD-...\\checkpoint-1000), "
+                "não '...' nem atalhos de exemplo."
+            )
+            sys.exit(1)
+        self.model_path = mp
 
         print(f"📥 Carregando FastSpeech 2 de: {self.model_path}")
         config_path = os.path.join(self.model_path, "config.json")
@@ -252,6 +628,11 @@ class FastSpeech2Inference(InferenceHandler):
             
         config = FastSpeech2Config()
         config.load_json(config_path)
+        mcfg = self.model_cfg.get("pitch_loss_alpha", None)
+        if mcfg is not None:
+            config.pitch_loss_alpha = float(mcfg)
+        # Mesmo processamento de espectro do treino (LJS: signal_norm false → mel em dB, sem [-4,4] manual)
+        self.ap = AudioProcessor.init_from_config(config)
         base_model = FastSpeech2.init_from_config(config)
         
         # Tentar carregar o checkpoint base antes de aplicar o Peft
@@ -279,7 +660,12 @@ class FastSpeech2Inference(InferenceHandler):
             
             # Carregar pesos do state_dict (Safetensors ou PyTorch Bin)
             weights_file = None
-            for wf in ["model.safetensors", "pytorch_model.bin", "adapter_model.bin"]:
+            for wf in [
+                "adapter_model.safetensors",
+                "model.safetensors",
+                "pytorch_model.bin",
+                "adapter_model.bin",
+            ]:
                 if os.path.exists(os.path.join(actual_model_path, wf)):
                     weights_file = os.path.join(actual_model_path, wf)
                     break
@@ -309,8 +695,12 @@ class FastSpeech2Inference(InferenceHandler):
                 if unexpected:
                     print(f"   ℹ️ {len(unexpected)} chaves ignoradas (provavelmente optimizers ou metadados).")
             else:
-                print(f"   ❌ ERRO: Nenhum arquivo de pesos encontrado em {actual_model_path}")
-                print(f"      Arquivos presentes: {os.listdir(actual_model_path)}")
+                print(f"   ❌ ERRO: Nenhum arquivo de pesos PEFT/Trainer em {actual_model_path}")
+                if os.path.isdir(actual_model_path):
+                    print(f"      Ficheiros na pasta: {os.listdir(actual_model_path)}")
+                else:
+                    print("      (a pasta não existe — verifica o caminho passado a --model_path)")
+                sys.exit(1)
 
         self.model.to(self.device).eval()
         
@@ -341,8 +731,12 @@ class FastSpeech2Inference(InferenceHandler):
         self.vocoder = HifiGan.init_from_config(v_config)
         self.vocoder.load_checkpoint(v_config, checkpoint_path=vocoder_file)
         self.vocoder.to(self.device).eval()
+
         self.tokenizer = base_model.tokenizer
-        
+        # Phonemizer/token default do LJS (EN) no *mesmo* model.pth — antes de Gruut; usado só em _ljs_english.wav
+        self._phonemizer_ljs_en = self.tokenizer.phonemizer
+        self._phonemizer_pt: Optional[object] = None
+
         # Tentar trocar para o phonemizer de PT se possível (como feito no treino)
         try:
             from TTS.tts.utils.text.phonemizers import get_phonemizer_by_name
@@ -356,52 +750,136 @@ class FastSpeech2Inference(InferenceHandler):
                     # Mapeamento de Precisão (Vogal + n) usando 'ɐ' para o som de 'ã' fechado.
                     replacements = {
                         'ã': 'ɐn', 'ẽ': 'en', 'ĩ': 'in', 'õ': 'on', 'ũ': 'un',
-                        '\u0303': 'n', 'g': 'ɡ'
+                        '\u0303': 'n',
                     }
-                    for k, v in replacements.items(): ph = ph.replace(k, v)
+                    for k, v in replacements.items():
+                        ph = ph.replace(k, v)
                     return ph
                 def name(self): return "pt_wrapper"
                 def print_logs(self, level): pass
                 
             new_phonemizer = PTPhonemizerWrapper(base_phonemizer)
             self.tokenizer.phonemizer = new_phonemizer
+            self._phonemizer_pt = new_phonemizer
             print(f"   🌐 Phonemizer do FastSpeech 2 substituído por Gruut (pt) com mapeamento cross-lingual")
         except Exception as e:
             print(f"   ⚠️ Aviso: Não foi possível trocar o phonemizer: {e}")
+            print(f"   ℹ️  Baselines 'pt' usarão o phonemizer ainda ativo (p. ex. stock EN).")
 
-    def generate(self, text, speaker_emb, use_lora=True):
-        print(f"   (FastSpeech 2) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
-        input_ids = torch.tensor([self.tokenizer.text_to_ids(text, language="pt")]).to(self.device)
+    def _forward_tts_module(self):
+        """Peft/ForwardTTS: onde vivem inference() e length_scale (Coqui)."""
+        m = self.model
+        for _ in range(16):
+            if m is None:
+                return None
+            if hasattr(m, "inference") and hasattr(m, "length_scale") and hasattr(m, "format_durations"):
+                return m
+            m = getattr(m, "base_model", None) or getattr(m, "model", None)
+        return None
+
+    def set_length_scale(self, scale: Optional[float]):
+        """>1.0 = mais lento/mais longo (Coqui: multiplica durações em format_durations). None = não altera."""
+        if scale is None:
+            return
+        s = float(scale)
+        core = self._forward_tts_module()
+        if core is not None:
+            core.length_scale = s
+            print(f"   📏 length_scale = {s} (duração ≈ fator nas durações previstas)")
+
+    def _mel_to_wav(self, mel_output, n_tokens, ap, length_scale_from=None):
+        """Ajusta shape do mel, log de métricas, HiFi-GAN. `length_scale_from`: módulo com atributo .length_scale."""
+        if mel_output.ndim == 3:
+            _, a, b = mel_output.shape
+            if a != 80 and b in (80, 90):
+                mel_output = mel_output.transpose(1, 2)
+        if mel_output.shape[1] > 80:
+            mel_output = mel_output[:, :80, :]
+        elif mel_output.shape[1] < 80:
+            mel_output = torch.nn.functional.pad(mel_output, (0, 0, 0, 80 - mel_output.shape[1]))
+        n_frames = int(mel_output.shape[-1])
+        hop = int(getattr(ap, "hop_length", 256))
+        sr = int(getattr(ap, "sample_rate", 22050))
+        est_s = n_frames * hop / max(sr, 1)
+        ls = None
+        if length_scale_from is not None and hasattr(length_scale_from, "length_scale"):
+            ls = float(length_scale_from.length_scale)
+        _ls = f", length_scale={ls}" if ls is not None else ""
+        print(
+            f"   📐 tokens_fon/ids={n_tokens} | mel_frames={n_frames} | ≈{est_s:.2f}s @ {sr}Hz hop={hop}{_ls} "
+            f"(duração vem do duration predictor; duration_loss no treino ≠ segundos)"
+        )
+        return self.vocoder.inference(mel_output).squeeze().cpu().numpy()
+
+    def generate(
+        self,
+        text,
+        speaker_emb,
+        use_lora=True,
+        fastspeech2_pipeline: Optional[str] = None,
+        **kwargs,
+    ):
+        # ljs_en:  model.pth + EN (sem LoRA)
+        # pt_base: model.pth + PT (Gruut), sem LoRA
+        # pt_lora: LoRA + PT (Gruut)
+        if fastspeech2_pipeline is None:
+            fastspeech2_pipeline = "pt_lora" if use_lora else "pt_base"
+        if fastspeech2_pipeline == "ljs_en":
+            label = "model.pth, pipeline EN (sem LoRA)"
+            print(f"   (FastSpeech 2) {label}: {text[:30]}...")
+            self.tokenizer.phonemizer = self._phonemizer_ljs_en
+            input_ids = torch.tensor(
+                [self.tokenizer.text_to_ids(text, language="en")]
+            ).to(self.device)
+            n_tokens = int(input_ids.shape[1])
+            with torch.no_grad():
+                with self.model.disable_adapter():
+                    outputs = self.model.inference(
+                        input_ids, aux_input={"d_vectors": None, "speaker_ids": None}
+                    )
+            return self._mel_to_wav(
+                outputs["model_outputs"],
+                n_tokens,
+                self.ap,
+                length_scale_from=self._forward_tts_module(),
+            )
+        if fastspeech2_pipeline == "pt_base":
+            if self._phonemizer_pt is not None:
+                self.tokenizer.phonemizer = self._phonemizer_pt
+            lang = "pt"
+            do_lora = False
+            label = "model.pth + PT (tokenizer + Gruut), sem LoRA"
+        elif fastspeech2_pipeline == "pt_lora":
+            if self._phonemizer_pt is not None:
+                self.tokenizer.phonemizer = self._phonemizer_pt
+            lang = "pt"
+            do_lora = True
+            label = "LoRA + PT (Gruut)"
+        else:
+            raise ValueError(
+                f"fastspeech2_pipeline desconhecido: {fastspeech2_pipeline!r} "
+                "(use 'ljs_en', 'pt_base', 'pt_lora' ou omita e use use_lora=True/False)."
+            )
+
+        print(f"   (FastSpeech 2) {label}: {text[:30]}...")
+        input_ids = torch.tensor([self.tokenizer.text_to_ids(text, language=lang)]).to(self.device)
+        n_tokens = int(input_ids.shape[1])
         with torch.no_grad():
-            if use_lora:
-                outputs = self.model.inference(input_ids, aux_input={"durations": None, "pitch": None, "energy": None, "length_scale": 1.0})
+            if do_lora:
+                outputs = self.model.inference(
+                    input_ids, aux_input={"d_vectors": None, "speaker_ids": None}
+                )
             else:
                 with self.model.disable_adapter():
-                    outputs = self.model.inference(input_ids)
-            mel_output = outputs["model_outputs"]
-            
-            # Ajustar dimensões para o vocoder (espera [B, C, T])
-            if mel_output.ndim == 3:
-                if mel_output.shape[2] == 80 or mel_output.shape[2] == 90:
-                    mel_output = mel_output.transpose(1, 2)
-            
-            # Garantir 80 canais
-            if mel_output.shape[1] > 80:
-                mel_output = mel_output[:, :80, :]
-            elif mel_output.shape[1] < 80:
-                mel_output = torch.nn.functional.pad(mel_output, (0, 0, 0, 80 - mel_output.shape[1]))
-
-            # --- CORREÇÃO DE ESCALA PARA O VOCODER ---
-            # Converte de [-4, 4] para [-100, 0]
-            min_level_db = -100
-            max_norm = 4.0
-            mel_norm = (mel_output / max_norm + 1) / 2.0
-            mel_raw = mel_norm * (-min_level_db) + min_level_db
-            mel_output = mel_raw.clamp(min_level_db, 0)
-            # -----------------------------------------
-
-            audio_out = self.vocoder.inference(mel_output)
-        return audio_out.squeeze().cpu().numpy()
+                    outputs = self.model.inference(
+                        input_ids, aux_input={"d_vectors": None, "speaker_ids": None}
+                    )
+        return self._mel_to_wav(
+            outputs["model_outputs"],
+            n_tokens,
+            self.ap,
+            length_scale_from=self._forward_tts_module(),
+        )
 
 class MatchaInference(InferenceHandler):
     def load(self):
@@ -412,7 +890,7 @@ class MatchaInference(InferenceHandler):
             sys.exit(1)
         print(f"📥 Carregando Matcha-TTS de: {self.model_path}")
         pass
-    def generate(self, text, speaker_emb, use_lora=True):
+    def generate(self, text, speaker_emb, use_lora=True, **kwargs):
         print(f"   (Matcha-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         return np.zeros(16000)
 
@@ -466,7 +944,7 @@ class GlowTTSInference(FastSpeech2Inference):
         self.vocoder.to(self.device).eval()
         self.tokenizer = base_model.tokenizer
 
-    def generate(self, text, speaker_emb, use_lora=True):
+    def generate(self, text, speaker_emb, use_lora=True, **kwargs):
         print(f"   (Glow-TTS) Gerando {'(LoRA)' if use_lora else '(Base)'}: {text[:30]}...")
         input_ids = torch.tensor([self.tokenizer.encode(text)]).to(self.device)
         with torch.no_grad():
@@ -507,9 +985,54 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", "--model_dir", type=str, required=True, help="Pasta do modelo treinado (ex: ./output_cuda_8gb/fastspeech2-...)")
     parser.add_argument("--text", type=str, default=None, help="Texto customizado para gerar áudio")
+    parser.add_argument(
+        "--length_scale",
+        type=float,
+        default=None,
+        help="FastPitch/Coqui: multiplica durações previstas (>1 = áudio mais longo). Ex.: 1.15 – 1.35 se sair tudo ~1s.",
+    )
     parser.add_argument("--profile", type=str, default=None)
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument(
+        "--apply_peak_normalization",
+        action="store_true",
+        help="Aplica normalização de pico antes de salvar WAV. Padrão: desativado.",
+    )
+    parser.add_argument(
+        "--test_text_seed",
+        type=int,
+        default=None,
+        help="Seed opcional para tornar reproduzível a seleção das sentenças de teste.",
+    )
+    parser.add_argument(
+        "--trained_bass_cut_hz",
+        type=float,
+        default=120.0,
+        help="Corte de graves (Hz) aplicado somente ao áudio treinado (LoRA).",
+    )
+    parser.add_argument(
+        "--trained_bass_atten_db",
+        type=float,
+        default=1.2,
+        help="Atenuação de graves em dB para o áudio treinado (ex.: 1.5 a 3.0).",
+    )
+    parser.add_argument(
+        "--apply_trained_bass_treatment",
+        action="store_true",
+        help="Aplica tratamento leve de graves no áudio treinado (LoRA). Padrão: desativado.",
+    )
+    parser.add_argument(
+        "--apply_silence_cleanup",
+        action="store_true",
+        help="Remove/comprime silêncios no áudio gerado pelo SpeechT5. Padrão: desativado.",
+    )
+    parser.add_argument(
+        "--silence_top_db",
+        type=float,
+        default=35.0,
+        help="Limite em dB para detectar silêncio no cleanup do SpeechT5.",
+    )
     args = parser.parse_args()
 
     full_cfg = load_config(args.config)
@@ -528,10 +1051,31 @@ def main():
     print(f"🚀 Iniciando Teste de Inferência...")
     print(f"   📂 Modelo: {model_path}")
     print(f"   💻 Hardware: {hw_name.upper()} ({device})")
+    if args.test_text_seed is None:
+        print("   🎲 Seleção de sentenças de teste: aleatória (sem seed)")
+    else:
+        print(f"   🎲 Seleção de sentenças de teste: reproduzível (seed={args.test_text_seed})")
+    if args.apply_trained_bass_treatment:
+        print(
+            "   🎛️ Tratamento de graves (LoRA): "
+            f"corte={args.trained_bass_cut_hz:.0f}Hz | atenuação={args.trained_bass_atten_db:.1f}dB"
+        )
+    else:
+        print("   🎛️ Tratamento de graves (LoRA): desativado")
+    print(
+        "   📈 Normalização de pico: "
+        + ("ativada" if args.apply_peak_normalization else "desativada")
+    )
+    print(
+        "   🧹 Cleanup de silêncio (SpeechT5): "
+        + (f"ativado (top_db={args.silence_top_db:.0f})" if args.apply_silence_cleanup else "desativado")
+    )
 
     # 1. Carregar Handler e Modelo
     handler = get_inference_handler(model_type, model_cfg, device, model_path)
     handler.load()
+    if model_type == "fastspeech2" and getattr(args, "length_scale", None) is not None and hasattr(handler, "set_length_scale"):
+        handler.set_length_scale(args.length_scale)
 
     sampling_rate = model_cfg.get('sampling_rate', 22050)
     
@@ -548,22 +1092,68 @@ def main():
         "O treinamento exaustivo foi finalizado com sucesso.",
         "Esta é uma demonstração de voz gerada por inteligência artificial.",
         "A qualidade do áudio melhorou significativamente após o ajuste fino.",
-        "Estamos testando a comparação entre o modelo base e o modelo treinado."
+        "Estamos testando a comparação entre o modelo base e o modelo treinado.",
+        "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
+        "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluida. Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto!",
     ]
     
     test_texts = []
     if args.text:
         test_texts.append(args.text)
-    test_texts.extend(default_texts)
+
+    dataset_test_texts = load_test_sentences_from_dataset(
+        full_cfg,
+        ds_cfg,
+        dataset_name,
+        limit=10,
+        seed=args.test_text_seed,
+    )
+    test_texts = _merge_unique_texts(test_texts, default_texts, dataset_test_texts)
 
     # 4. Criar pasta de saída
     type_str = "custom" if args.text else "batch"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(model_path, f"inference_{type_str}_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
-    
-    print(f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças...")
+    write_inference_sentences_txt(out_dir, test_texts)
+
+    if model_type == "fastspeech2":
+        print(
+            f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças (3 WAV por frase): "
+            f"(1) _ljs_english = model.pth, EN, sem LoRA  "
+            f"(2) _pt_original = model.pth + PT  "
+            f"(3) _pt_treinado = LoRA + PT"
+        )
+    else:
+        print(f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças...")
     print(f"   🎯 Resultados em: {out_dir}")
+    print(
+        "   📏 (mesmo SR) tamanho WAV ≈ proporcional à duração; treinado muito menor ⇒ geralmente "
+        "menos frames de mel (duration predictor), não 'qualidade de ficheiro'."
+    )
+
+    def _wav_report(path: str, audio_arr, sr: int) -> None:
+        if audio_arr is None:
+            return
+        n = len(np.asarray(audio_arr).reshape(-1))
+        dur = n / float(sr) if sr else 0.0
+        b = os.path.getsize(path) if os.path.isfile(path) else 0
+        print(f"      → {os.path.basename(path)} | {b:,} bytes | ~{dur:.2f}s @ {sr}Hz")
+
+    def _finalize_audio(audio_arr, is_trained: bool = False):
+        out = np.asarray(audio_arr, dtype=np.float32).reshape(-1)
+        if is_trained and args.apply_trained_bass_treatment:
+            out = attenuate_low_frequencies(
+                out,
+                sampling_rate,
+                cutoff_hz=args.trained_bass_cut_hz,
+                attenuation_db=args.trained_bass_atten_db,
+            )
+        if model_type == "speecht5" and args.apply_silence_cleanup:
+            out = trim_and_compress_silence(out, sampling_rate, top_db=args.silence_top_db)
+        if args.apply_peak_normalization:
+            out = peak_normalize_audio(out)
+        return out
 
     # 5. Executar Inferência
     for i, text in enumerate(test_texts):
@@ -571,24 +1161,78 @@ def main():
         clean_text = normalize_text(text)
         prefix = "custom" if (args.text and i == 0) else f"sentenca_{i+1}"
         
-        # Original (Base)
-        print(f"   🔊 Gerando ORIGINAL...")
-        try:
-            audio_orig = handler.generate(clean_text, speaker_emb, use_lora=False)
-            sf.write(os.path.join(out_dir, f"{prefix}_original.wav"), audio_orig, sampling_rate)
-        except Exception as e:
-            print(f"   ⚠️ Erro no modelo original: {e}")
+        if model_type == "fastspeech2":
+            # 1) model.pth, EN, sem LoRA
+            print(f"   (1) _ljs_english — model.pth, EN, sem LoRA...")
+            try:
+                audio_ljs = handler.generate(
+                    clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="ljs_en"
+                )
+                p_ljs = os.path.join(out_dir, f"{prefix}_ljs_english.wav")
+                audio_ljs_out = _finalize_audio(audio_ljs, is_trained=False)
+                sf.write(p_ljs, audio_ljs_out, sampling_rate)
+                _wav_report(p_ljs, audio_ljs_out, sampling_rate)
+            except Exception as e:
+                print(f"   ⚠️ Erro (LJS/EN): {e}")
 
-        # Treinado (LoRA)
-        print(f"   🔥 Gerando TREINADO (LoRA)...")
-        try:
-            audio_lora = handler.generate(clean_text, speaker_emb, use_lora=True)
-            sf.write(os.path.join(out_dir, f"{prefix}_treinado.wav"), audio_lora, sampling_rate)
-            # Se for a frase customizada, salvar também na raiz para facilitar
-            if args.text and i == 0:
-                sf.write("output_inference.wav", audio_lora, sampling_rate)
-        except Exception as e:
-            print(f"   ⚠️ Erro no modelo treinado: {e}")
+            # 2) model.pth + PT (Gruut), sem LoRA
+            print(f"   (2) _pt_original — model.pth + PT (tokenizer + Gruut)...")
+            try:
+                audio_pt_base = handler.generate(
+                    clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="pt_base"
+                )
+                p_pt_base = os.path.join(out_dir, f"{prefix}_pt_original.wav")
+                audio_pt_base_out = _finalize_audio(audio_pt_base, is_trained=False)
+                sf.write(p_pt_base, audio_pt_base_out, sampling_rate)
+                _wav_report(p_pt_base, audio_pt_base_out, sampling_rate)
+            except Exception as e:
+                print(f"   ⚠️ Erro (base+PT): {e}")
+                audio_pt_base = None
+
+            # 3) LoRA + PT
+            print(f"   (3) _pt_treinado — LoRA + PT...")
+            try:
+                audio_lora = handler.generate(
+                    clean_text, speaker_emb, use_lora=True, fastspeech2_pipeline="pt_lora"
+                )
+                p_lora = os.path.join(out_dir, f"{prefix}_pt_treinado.wav")
+                audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
+                sf.write(p_lora, audio_lora_out, sampling_rate)
+                _wav_report(p_lora, audio_lora_out, sampling_rate)
+                if audio_pt_base is not None and len(np.asarray(audio_pt_base).reshape(-1)) > 0:
+                    ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_pt_base).reshape(-1))
+                    print(f"      📊 Razão duração pt_treinado / pt_base ≈ {ratio:.2f}×")
+                if args.text and i == 0:
+                    sf.write("output_inference.wav", audio_lora_out, sampling_rate)
+            except Exception as e:
+                print(f"   ⚠️ Erro (LoRA+PT): {e}")
+        else:
+            # Outros modelos: mantém pares base vs LoRA
+            print(f"   🔊 Gerando ORIGINAL (base sem LoRA)...")
+            try:
+                audio_orig = handler.generate(clean_text, speaker_emb, use_lora=False)
+                p_orig = os.path.join(out_dir, f"{prefix}_original.wav")
+                audio_orig_out = _finalize_audio(audio_orig, is_trained=False)
+                sf.write(p_orig, audio_orig_out, sampling_rate)
+                _wav_report(p_orig, audio_orig_out, sampling_rate)
+            except Exception as e:
+                print(f"   ⚠️ Erro no modelo original: {e}")
+                audio_orig = None
+
+            print(f"   🔥 Gerando TREINADO (LoRA)...")
+            try:
+                audio_lora = handler.generate(clean_text, speaker_emb, use_lora=True)
+                p_lora = os.path.join(out_dir, f"{prefix}_treinado.wav")
+                audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
+                sf.write(p_lora, audio_lora_out, sampling_rate)
+                _wav_report(p_lora, audio_lora_out, sampling_rate)
+                if audio_orig is not None and len(np.asarray(audio_orig).reshape(-1)) > 0:
+                    ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_orig).reshape(-1))
+                    print(f"      📊 Razão duração treinado/original ≈ {ratio:.2f}×")
+                if args.text and i == 0:
+                    sf.write("output_inference.wav", audio_lora_out, sampling_rate)
+            except Exception as e:
+                print(f"   ⚠️ Erro no modelo treinado: {e}")
             
     print(f"\n✅ Concluído! Todos os arquivos estão na pasta: {out_dir}")
 

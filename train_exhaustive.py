@@ -5,7 +5,7 @@ import warnings
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Carregar variáveis de ambiente (HF_TOKEN)
+# .env (ex.: HF_TOKEN para Hugging Face Hub) — uma chamada basta; não duplicar em baixo
 load_dotenv()
 
 # Evita spam de warning conhecido do SpeechBrain/Torchaudio durante o treino.
@@ -15,10 +15,19 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+import importlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# Garante que o pacote *real* torch.distributed.tensor carrega cedo. Não usar stub aqui: um ModuleType
+# falso substitui o pacote e o Adam/compile importa DTensor/FSdP e rebenta com ImportError.
+try:
+    importlib.import_module("torch.distributed.tensor")
+except ImportError:
+    pass  # instalação sem distributed tensor; single-GPU / treino ainda costuma seguir
 
 # Fix para PyTorch 2.6 e resume do Trainer
 # O PyTorch 2.6 restringe load() de estados do numpy salvos pelo transformers.
@@ -29,6 +38,7 @@ def safe_load(*args, **kwargs):
     return _original_load(*args, **kwargs)
 torch.load = safe_load
 
+import json
 import yaml
 import torchaudio
 import unicodedata
@@ -36,10 +46,6 @@ import argparse
 import numpy as np
 import librosa
 import soundfile as sf
-from dotenv import load_dotenv
-
-# Carregar variáveis de ambiente (HF_TOKEN)
-load_dotenv()
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union, Optional
 from collections import Counter
@@ -48,6 +54,60 @@ from datasets import load_dataset, Audio, Dataset, load_from_disk
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan, TrainerCallback
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
+
+
+def _device_for_speechbrain(device: str) -> str:
+    # SpeechBrain faz parse de 'device' e, em algumas versões, 'cuda' sem índice → "expected 2, got 1"
+    if device == "cuda" and torch.cuda.is_available():
+        return f"cuda:{torch.cuda.current_device()}"
+    return device
+
+
+def _get_peft_model_for_save(model) -> Optional[PeftModel]:
+    """Encontra o PeftModel embutido (wrapper FS2, SpeechT5, XTTS.gpt, Glow-TTS .encoder, etc.)."""
+    if isinstance(model, PeftModel):
+        return model
+    m = getattr(model, "model", None)
+    if m is not None and isinstance(m, PeftModel):
+        return m
+    gpt = getattr(getattr(model, "xtts", None), "gpt", None)
+    if gpt is not None and isinstance(gpt, PeftModel):
+        return gpt
+    base = getattr(model, "model", None)
+    if base is not None and hasattr(base, "encoder") and isinstance(base.encoder, PeftModel):
+        return base.encoder
+    return None
+
+
+def save_peft_adapter_for_inference(model, out_dir: str) -> bool:
+    """
+    Garante adapter_config.json + adapter_model.safetensors (ou .bin) em out_dir, formato p/ inferência.
+    A backbone (ex.: model.pth LJS) continua a vir do repositório Coqui na inferência.
+    """
+    peft = _get_peft_model_for_save(model)
+    if peft is None:
+        return False
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        peft.save_pretrained(out_dir, safe_serialization=True)
+    except (ImportError, OSError, TypeError, ValueError):
+        peft.save_pretrained(out_dir, safe_serialization=False)
+    return True
+
+
+class PeftAdapterSaveCallback(TrainerCallback):
+    """O Trainer grava o state do wrapper; este callback acrescenta o bundle PEFT em cada checkpoint-*."""
+
+    def __init__(self, model: torch.nn.Module):
+        self._model = model
+
+    def on_save(self, args, state, control, **kwargs):
+        sub = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(sub):
+            return
+        if save_peft_adapter_for_inference(self._model, sub):
+            print(f"   💾 PEFT (adapter_config + adapter) → {sub}")
+
 
 class LogMetricsCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -61,10 +121,10 @@ class LogMetricsCallback(TrainerCallback):
             if hasattr(m, "last_metrics"):
                 # Mapeamento de possíveis nomes de chaves do Coqui
                 key_map = {
-                    "f0_rmse_hz": "f0_rmse_hz",
-                    "pitch_loss": ["pitch_loss", "loss_pitch", "pitch"],
-                    "duration_loss": ["loss_dur", "duration_loss", "loss_duration"],
                     "mel_loss": ["loss_spec", "mel_loss", "loss_mel"],
+                    "duration_loss": ["loss_dur", "duration_loss", "loss_duration"],
+                    "pitch_mse": ["pitch_mse", "loss_pitch", "pitch_loss"],
+                    "f0_rmse_hz": "f0_rmse_hz",
                     "aligner_sharpness": ["loss_binary_alignment", "loss_aligner", "binary_loss"]
                 }
                 
@@ -126,6 +186,9 @@ def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
+# Sufixo de pasta de cache: incrementar se mudar F0 / mel em prepare_item (FastPitch)
+FS2_F0_DATASET_VERSION = "f0zscore_v1"
+
 def detect_hardware_profile(full_cfg):
     """Tenta identificar o melhor perfil de hardware automaticamente."""
     print("🔍 Autodetectando hardware...")
@@ -174,7 +237,7 @@ class ModelHandler:
         self.processor = None
         self.model = None
 
-    def load(self, resume_from=None):
+    def load(self, resume_from=None, resume_model_only=False):
         raise NotImplementedError()
 
     def prepare_item(self, item, processor, speaker_model):
@@ -184,7 +247,7 @@ class ModelHandler:
         raise NotImplementedError()
 
 class SpeechT5Handler(ModelHandler):
-    def load(self, resume_from=None):
+    def load(self, resume_from=None, resume_model_only=False):
         print(f"📥 Carregando SpeechT5: {self.model_cfg['id']}")
         self.processor = SpeechT5Processor.from_pretrained(self.model_cfg['id'])
         self.vocoder = SpeechT5HifiGan.from_pretrained(self.model_cfg['vocoder_id']).to(self.device)
@@ -200,27 +263,51 @@ class SpeechT5Handler(ModelHandler):
             bias="none", task_type=None
         )
         
-        if resume_from and os.path.exists(os.path.join(resume_from, "adapter_config.json")):
+        has_adapter = resume_from and os.path.exists(os.path.join(resume_from, "adapter_config.json"))
+        if has_adapter and not resume_model_only:
             print(f"🔄 Carregando adaptadores LoRA existentes de: {resume_from}")
             self.model = PeftModel.from_pretrained(self.model, resume_from, is_trainable=True)
         else:
             self.model = get_peft_model(self.model, peft_config)
+            if resume_from and resume_model_only and has_adapter:
+                wpath = os.path.join(resume_from, "adapter_model.safetensors")
+                if not os.path.exists(wpath):
+                    wpath = os.path.join(resume_from, "pytorch_model.bin")
+                if not os.path.exists(wpath):
+                    print(
+                        f"   ⚠️ --resume_model_only: nenhum adapter_model.safetensors/pytorch_model.bin em {resume_from}; "
+                        f"iniciando LoRA novo a partir de zero."
+                    )
+                else:
+                    if wpath.endswith(".safetensors"):
+                        from safetensors.torch import load_file
+                        st = load_file(wpath)
+                    else:
+                        st = torch.load(wpath, map_location="cpu")
+                    miss, uexp = self.model.load_state_dict(st, strict=False)
+                    print(
+                        f"   🔀 --resume_model_only: load_state_dict(strict=False) — "
+                        f"{len(st)} tensores no ficheiro; missing={len(miss)} unexpected={len(uexp)} (normal se alterou LoRA)."
+                    )
         # Garantir contiguidade em parâmetros e BUFFERS (essencial p/ pos_encoder.pe)
         for p in self.model.parameters():
             if not p.is_contiguous(): p.data = p.data.contiguous()
         for b in self.model.buffers():
             if not b.is_contiguous(): b.data = b.data.contiguous()
             
-        return self.model, processor
+        return self.model, self.processor
 
     def prepare_item(self, batch, processor, speaker_model, language=None):
         audio = batch["audio"]
         clean_text = normalize_text(batch.get("text", "dummy"))
         batch["input_ids"] = processor(text=clean_text, return_tensors="pt").input_ids[0]
         y = np.array(audio["array"])
+        mel_sr = int(self.model_cfg.get("sampling_rate", 16000))
         
-        # SpeechT5 espera mel-spectrogram como labels
-        mel = librosa.feature.melspectrogram(y=y, sr=16000, n_fft=1024, hop_length=256, n_mels=80, fmin=80, fmax=7600)
+        # SpeechT5 espera mel-spectrogram como labels (alinhado a target_sr do cast_column)
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=mel_sr, n_fft=1024, hop_length=256, n_mels=80, fmin=80, fmax=7600
+        )
         log_mel = np.log10(np.clip(mel, 1e-5, None)).T
         batch["labels"] = torch.tensor(log_mel)
         
@@ -258,7 +345,7 @@ class F5CFMWrapper(torch.nn.Module):
         return {"loss": loss}
 
 class F5TTSHandler(ModelHandler):
-    def load(self):
+    def load(self, resume_from=None, resume_model_only=False):
         try:
             from f5_tts.model import DiT, CFM
             from f5_tts.model.utils import get_tokenizer
@@ -363,7 +450,7 @@ class XTTSWrapper(torch.nn.Module):
         return {"loss": loss, "logits": logits}
 
 class XTTSHandler(ModelHandler):
-    def load(self):
+    def load(self, resume_from=None, resume_model_only=False):
         try:
             from TTS.tts.configs.xtts_config import XttsConfig
             from TTS.tts.models.xtts import Xtts
@@ -489,6 +576,9 @@ class XTTSHandler(ModelHandler):
         return XTTSDataCollator()
 
 class FastSpeech2Wrapper(torch.nn.Module):
+    # Trainer._issue_warnings_after_load (resume) acede a isto em PreTrainedModel; wrapper puro não tem.
+    _keys_to_ignore_on_save = None
+
     def __init__(self, model, device):
         super().__init__()
         self.model = model
@@ -498,6 +588,42 @@ class FastSpeech2Wrapper(torch.nn.Module):
         base_model = getattr(self.model, "base_model", self.model)
         if hasattr(base_model, "model"): base_model = base_model.model
         self.criterion = base_model.get_criterion()
+        self._pitch_loss_alpha = 0.0
+        m = self.model
+        for _ in range(8):
+            if m is not None and hasattr(m, "config") and m.config is not None and hasattr(m.config, "pitch_loss_alpha"):
+                self._pitch_loss_alpha = float(m.config.pitch_loss_alpha)
+                break
+            m = getattr(m, "base_model", None) or getattr(m, "model", None)
+        # Para f0_rmse_hz: mesmos mean/std (Hz) usados no z-score dos alvos; definir com set_f0_denorm após f0_stats
+        self.f0_denorm_mean: Optional[float] = None
+        self.f0_denorm_std: Optional[float] = None
+        # 0.0 = sem contrib. binária no loss total; 1.0 = pleno. Atualizado por BinaryAlignWarmupCallback
+        self._binary_warm: float = 1.0
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            try:
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+            except TypeError:
+                self.model.gradient_checkpointing_enable()
+            print("OK: gradient_checkpointing repassado ao PeftModel/base (se suportado).")
+        else:
+            print("Aviso: gradient_checkpointing_enable ignorado — base sem suporte (ForwardTTS não-HF puro).")
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+
+    def is_gradient_checkpointing(self):
+        if hasattr(self.model, "is_gradient_checkpointing"):
+            return bool(self.model.is_gradient_checkpointing())
+        return False
+
+    def set_f0_denorm(self, mean: Optional[float], std: Optional[float]) -> None:
+        """Estatísticas de treino (Hz) para reportar RMSE de F0 em Hz (não em z-score)."""
+        self.f0_denorm_mean = None if mean is None else float(mean)
+        self.f0_denorm_std = None if std is None else max(float(std), 1.0)
         
     def forward(self, x=None, x_lengths=None, y=None, y_lengths=None, **kwargs):
         pitch = kwargs.pop('pitch', None)
@@ -536,8 +662,18 @@ class FastSpeech2Wrapper(torch.nn.Module):
                 alignment_logprob=outputs.get("alignment_logprob", None),
                 alignment_soft=outputs["alignment_soft"],
                 alignment_hard=outputs["alignment_mas"],
-                binary_loss_weight=1.0 # Crucial para o Aligner convergir! Estava em 0.0, impedindo o aprendizado de duração.
+                binary_loss_weight=1.0,
             )
+            # Ajuste de warmup: em Coqui, return_dict['loss'] já inclui o binary completo; loss_binary_alignment (com weight=1)
+            # coincide com a parcela a subtrair/reintroduzir. Ver config binary_align_warmup_steps.
+            if (
+                "loss_binary_alignment" in loss_dict
+                and self._binary_warm < 1.0 - 1e-8
+            ):
+                b = loss_dict["loss_binary_alignment"]
+                if hasattr(b, "float"):
+                    b = b.float()
+                loss_dict["loss"] = loss_dict["loss"] - (1.0 - self._binary_warm) * b
             
             # Depuração: imprimir as chaves na primeira vez para sabermos os nomes exatos
             if not hasattr(self, "_keys_printed"):
@@ -545,16 +681,37 @@ class FastSpeech2Wrapper(torch.nn.Module):
                 print(f"\n🔍 [DEBUG] Métricas detectadas no Coqui: {keys}")
                 self._keys_printed = True
 
-            # Calcular F0 RMSE em Hz para monitoramento humano
-            p_key = next((k for k in loss_dict.keys() if "pitch" in k), None)
-            if p_key:
-                pitch_mse = loss_dict[p_key].item()
-                f0_rmse_hz = 50.0 * (pitch_mse ** 0.5)
-                loss_dict["f0_rmse_hz"] = f0_rmse_hz
-            
+            # MSE de pitch (espaço z-score de F0, não Hz) — só se pitch_loss_alpha>0
+            if "loss_pitch" in loss_dict and self._pitch_loss_alpha > 0:
+                lp = loss_dict["loss_pitch"]
+                v = float(lp.detach() if hasattr(lp, "detach") else lp) / (self._pitch_loss_alpha + 1e-12)
+                loss_dict["pitch_mse"] = v
+                loss_dict["pitch_rmse_zscore"] = v ** 0.5  # raiz do MSE no espaço z-score, não Hz
+
+            # RMSE de F0 em Hz (só com mean/std e tensores de pitch; máscara: alvo com F0 ativo, estilo TTS)
+            if (
+                self.f0_denorm_mean is not None
+                and self.f0_denorm_std is not None
+                and outputs.get("pitch_avg") is not None
+                and outputs.get("pitch_avg_gt") is not None
+            ):
+                m0, s0 = self.f0_denorm_mean, self.f0_denorm_std
+                gto = outputs["pitch_avg_gt"]
+                prz = outputs["pitch_avg"]
+                with torch.no_grad():
+                    g_hz = gto * s0 + m0
+                    p_hz = prz * s0 + m0
+                    mask = gto.abs() > 1e-5
+                    if mask.any():
+                        d = (g_hz[mask] - p_hz[mask]).float()
+                        loss_dict["f0_rmse_hz"] = float((d * d).mean().sqrt().item())
+                    else:
+                        loss_dict["f0_rmse_hz"] = 0.0
+
             # Salvar no modelo para o Callback de log acessar
-            # Adicionando explicitamente o aligner_loss para monitoramento de nitidez
-            if "binary_loss" in loss_dict:
+            if "loss_binary_alignment" in loss_dict:
+                loss_dict["aligner_sharpness"] = loss_dict["loss_binary_alignment"]
+            elif "binary_loss" in loss_dict:
                 loss_dict["aligner_sharpness"] = loss_dict["binary_loss"]
                 
             self.last_metrics = loss_dict
@@ -562,7 +719,7 @@ class FastSpeech2Wrapper(torch.nn.Module):
             return {"loss": loss_dict["loss"], "model_outputs": outputs["model_outputs"]}
 
 class FastSpeech2Handler(ModelHandler):
-    def load(self, resume_from=None):
+    def load(self, resume_from=None, resume_model_only=False):
         try:
             from TTS.utils.manage import ModelManager
             from TTS.tts.models.forward_tts import ForwardTTS as FastSpeech2
@@ -588,9 +745,13 @@ class FastSpeech2Handler(ModelHandler):
         config_path = os.path.join(model_dir, "config.json")
         config = FastSpeech2Config()
         config.load_json(config_path)
+        if "pitch_loss_alpha" in self.model_cfg and self.model_cfg["pitch_loss_alpha"] is not None:
+            config.pitch_loss_alpha = float(self.model_cfg["pitch_loss_alpha"])
         
         # Inicializar o AudioProcessor oficial com a config do modelo
         self.ap = AudioProcessor.init_from_config(config)
+        self.f0_norm_mean: Optional[float] = None
+        self.f0_norm_std: Optional[float] = None
         
         # Ajuste de segurança para detecção de Pitch (F0)
         # Valores abaixo de 50 Hz causam erro no librosa.pyin com janelas de 1024
@@ -646,7 +807,14 @@ class FastSpeech2Handler(ModelHandler):
         print(f"✅ LoRA aplicado ao FastSpeech 2.")
         
         self.model = FastSpeech2Wrapper(self.model_fs2, self.device)
-        
+        self.f0_input_mode: str = str(self.model_cfg.get("f0_input_mode", "zscore")).lower()
+        if self.f0_input_mode == "raw_hz":
+            print(
+                "⚠️ f0_input_mode=raw_hz não é suportado com tts_models/en/ljspeech/fast_pitch (LJS usou F0 em z-score). "
+                "A usar 'zscore' (mean/std a partir de f0_stats do corpus / LJS).",
+            )
+            self.f0_input_mode = "zscore"
+
         # Substituir o fonemizador original pelo de português (Gruut)
         try:
             from TTS.tts.utils.text.phonemizers import get_phonemizer_by_name
@@ -658,11 +826,13 @@ class FastSpeech2Handler(ModelHandler):
                 def phonemize(self, text, separator="", language="pt"):
                     ph = self.p.phonemize(text, separator=separator, language=language)
                     # Mapeamento de Precisão: Usamos 'ɐ' (presente no vocab base) para o 'a' fechado/nasal.
+                    # Não fazer replace global de 'g' (destrói IPA). Apenas vogais nasais mapeáveis.
                     replacements = {
                         'ã': 'ɐn', 'ẽ': 'en', 'ĩ': 'in', 'õ': 'on', 'ũ': 'un',
-                        '\u0303': 'n', 'g': 'ɡ'
+                        '\u0303': 'n',
                     }
-                    for k, v in replacements.items(): ph = ph.replace(k, v)
+                    for k, v in replacements.items():
+                        ph = ph.replace(k, v)
                     return ph
                 def name(self): return "pt_wrapper"
                 def print_logs(self, level): pass
@@ -675,6 +845,35 @@ class FastSpeech2Handler(ModelHandler):
             
         self.model_fs2.to(self.device)
         return self.model, self.model_fs2.tokenizer
+
+    def set_f0_zscore_stats(self, mean: float, std: float):
+        """Estatísticas globais (Hz) em frames não nulos, estilo TTS/tts/datasets F0Dataset."""
+        self.f0_norm_mean = float(mean)
+        self.f0_norm_std = max(float(std), 1.0)
+
+    def compute_f0_zscore_from_train_dataset(self, train_dataset, max_samples: Optional[int] = None) -> None:
+        """Uma passagem pelo treino: concatena f0>0 (Hz) e define mean/std (Coqui-style)."""
+        import librosa
+        vals: List[np.ndarray] = []
+        n = len(train_dataset) if max_samples is None else min(len(train_dataset), max_samples)
+        for i in range(n):
+            item = train_dataset[i]
+            y = np.array(item["audio"]["array"], dtype=np.float32)
+            sr = item["audio"].get("sampling_rate", self.ap.sample_rate)
+            if int(sr) != int(self.ap.sample_rate):
+                y = librosa.resample(y, orig_sr=int(sr), target_sr=int(self.ap.sample_rate))
+            f0 = self.ap.compute_f0(y)
+            f0 = np.nan_to_num(f0)
+            nz = f0[f0 > 0.0]
+            if nz.size:
+                vals.append(nz)
+        if not vals:
+            self.set_f0_zscore_stats(150.0, 40.0)
+            print("⚠️ F0: sem amostras não nulas; usando mean=150, std=40 (fallback).")
+            return
+        cat = np.concatenate(vals)
+        self.set_f0_zscore_stats(float(np.mean(cat)), float(np.std(cat)))
+        print(f"📈 F0 z-score: mean={self.f0_norm_mean:.2f} Hz, std={self.f0_norm_std:.2f} Hz (n={len(cat)} frame values)")
 
     def prepare_item(self, batch, processor, speaker_model, language="en"):
         audio = batch["audio"]
@@ -695,15 +894,15 @@ class FastSpeech2Handler(ModelHandler):
         mel_spec = self.ap.melspectrogram(y) 
         y_tensor = torch.tensor(mel_spec.T) # [T, C]
         
-        # Extração de Pitch (F0)
+        # F0: Hz, depois z-score (mean/std) em frames f0>0, zeros mantidos — alinhado a TTS/tts/datasets F0Dataset
         pitch = self.ap.compute_f0(y)
-        pitch = np.nan_to_num(pitch)
-        
-        # Normalização de Pitch (padrão do Coqui para FastPitch)
-        if pitch.any():
-            pitch = np.log(np.clip(pitch, 1.0, None) + 1.0)
-            pitch = (pitch - 5.0) / 0.5 
-            
+        pitch = np.nan_to_num(pitch).astype(np.float32)
+        if self.f0_norm_mean is not None and self.f0_norm_std is not None:
+            m, s = self.f0_norm_mean, self.f0_norm_std
+            nz = pitch > 0.0
+            if np.any(nz):
+                pitch = pitch.copy()
+                pitch[nz] = (pitch[nz] - m) / s
         if len(pitch) > y_tensor.shape[0]: pitch = pitch[:y_tensor.shape[0]]
         elif len(pitch) < y_tensor.shape[0]: pitch = np.pad(pitch, (0, y_tensor.shape[0] - len(pitch)))
         
@@ -732,7 +931,7 @@ class MatchaWrapper(torch.nn.Module):
         return {"loss": outputs["loss"]}
 
 class MatchaHandler(ModelHandler):
-    def load(self):
+    def load(self, resume_from=None, resume_model_only=False):
         try:
             from matcha.models.matcha_tts import MatchaTTS
         except ImportError:
@@ -798,7 +997,7 @@ class MatchaHandler(ModelHandler):
 
 class GlowTTSHandler(FastSpeech2Handler):
     # Glow-TTS compartilha muita lógica com o FastSpeech 2 na Coqui
-    def load(self):
+    def load(self, resume_from=None, resume_model_only=False):
         try:
             from TTS.utils.manage import ModelManager
             from TTS.tts.models.glow_tts import GlowTTS
@@ -829,7 +1028,7 @@ class GlowTTSHandler(FastSpeech2Handler):
         return self.model, self.model_glow.tokenizer
 
 class GenericSOTAHandler(ModelHandler):
-    def load(self):
+    def load(self, resume_from=None, resume_model_only=False):
         print(f"⚠️ O modelo {self.model_cfg['id']} requer implementações customizadas.")
         sys.exit(1)
 
@@ -865,6 +1064,41 @@ class ValidationCallback(TrainerCallback):
                 else:
                     print(f"   {name}: {value}")
             print("--------------------------------------------------\n")
+
+
+class BinaryAlignWarmupCallback(TrainerCallback):
+    """Rampa linear 0→1 do peso efetivo do binary alignment (só a parcela reescrita no wrapper FastSpeech2)."""
+    def __init__(self, warmup_steps: int = 0, model_ref: Any = None):
+        self.warmup_steps = max(0, int(warmup_steps))
+        self._model_ref = model_ref
+
+    @staticmethod
+    def _set_binary_warm(model: Any, w: float) -> None:
+        cur: Any = model
+        for _ in range(12):
+            if cur is not None and hasattr(cur, "_binary_warm"):
+                cur._binary_warm = float(w)
+                return
+            nxt = getattr(cur, "module", None) or getattr(cur, "base_model", None) or getattr(cur, "model", None)
+            if nxt is None or nxt is cur:
+                return
+            cur = nxt
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.warmup_steps <= 0:
+            return
+        m = self._model_ref or model or kwargs.get("model")
+        if m is not None:
+            self._set_binary_warm(m, 0.0)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.warmup_steps <= 0:
+            return
+        m = self._model_ref or model or kwargs.get("model")
+        if m is None:
+            return
+        w = min(1.0, float(state.global_step) / float(self.warmup_steps))
+        self._set_binary_warm(m, w)
 
 
 def format_duration(seconds):
@@ -914,6 +1148,12 @@ def main():
     parser.add_argument("--dataset", type=str, default=None, help="Perfil do dataset configurado no YAML")
     parser.add_argument("--config", type=str, default="config.yaml", help="Caminho do arquivo config.yaml")
     parser.add_argument("--resume_from", type=str, default=None, help="Caminho para checkpoint ou modelo para continuar treinamento")
+    parser.add_argument(
+        "--resume_model_only",
+        action="store_true",
+        help="Com --resume_from: carrega só os pesos no modelo (ex.: após mudar target_modules LoRA); "
+        "NÃO reutiliza optimizer/scheduler/global_step do checkpoint (evita incompat. de parâmetros).",
+    )
     args = parser.parse_args()
 
     full_cfg = load_config(args.config)
@@ -937,12 +1177,20 @@ def main():
     hw_cfg = full_cfg['hardware_profiles'].get(hw_profile, full_cfg['hardware_profiles']['cpu'])
     device = hw_cfg.get('device', 'cpu')
     
+    # O wrapper FastPitch força o forward do Coqui em FP32 (autocast off); TF32 + cudnn aliviam custo nessa parte.
+    if device == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+        print(
+            "🚀 CUDA: TF32 em matmul FP32 + cudnn.benchmark=True (forward TTS/aligner fica em FP32; o Trainer pode usar half no resto se fp16=on).",
+        )
+
     if model_type == 'f5_tts' and device == 'cuda' and hw_cfg['batch_size'] > 2:
         multiplier = hw_cfg['batch_size'] // 2
         hw_cfg['gradient_accumulation_steps'] = hw_cfg.get('gradient_accumulation_steps', 1) * multiplier
         hw_cfg['batch_size'] = 2
         print(f"⚠️ Otimizando p/ F5-TTS: Batch size reduzido para 2 e Gradient Accumulation na GPU para {hw_cfg['gradient_accumulation_steps']}x para evitar Timeouts.")
-    
+
     # 3. Output Dir
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     out_dir = os.path.join(hw_cfg['output_dir'], f"{model_type}-{dataset_name}-{timestamp}")
@@ -955,7 +1203,9 @@ def main():
 
     # 4. Handler e Carregamento do Modelo
     handler = get_handler(model_type, model_cfg, device)
-    model, processor = handler.load(resume_from=args.resume_from)
+    model, processor = handler.load(
+        resume_from=args.resume_from, resume_model_only=bool(getattr(args, "resume_model_only", False))
+    )
 
     # 5. Dataset Loading
     local_root = full_cfg.get('settings', {}).get('local_datasets_dir', './datasets')
@@ -1076,7 +1326,6 @@ def main():
     print("----------------------------------------------------------\n")
     
     # Exportar dataset_split.json
-    import json
     split_info = {
         "train_speakers": list(train_spks),
         "val_speakers": list(val_spks),
@@ -1102,14 +1351,46 @@ def main():
     speaker_model = None
     if 'speaker_encoder_id' in model_cfg:
         from speechbrain.inference.classifiers import EncoderClassifier
-        speaker_model = EncoderClassifier.from_hparams(source=model_cfg['speaker_encoder_id'], run_opts={"device": device})
+        speaker_model = EncoderClassifier.from_hparams(
+            source=model_cfg['speaker_encoder_id'], run_opts={"device": _device_for_speechbrain(device)}
+        )
     
     language = ds_cfg.get("language", "pt")
     
-    # Sistema de Cache Hard (Disco)
-    cache_base_dir = os.path.join(full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'), "cache_processado", f"{model_type}_{dataset_name}_{target_sr}hz")
+    # Sistema de Cache Hard (Disco) — sufixo fs2 força recache ao mudar F0 (f0zscore_v1, etc.)
+    _fs2_cache_suffix = f"_{FS2_F0_DATASET_VERSION}" if model_type == "fastspeech2" else ""
+    cache_base_dir = os.path.join(
+        full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'),
+        "cache_processado",
+        f"{model_type}_{dataset_name}_{target_sr}hz{_fs2_cache_suffix}",
+    )
     train_cache_path = os.path.join(cache_base_dir, "train")
     val_cache_path = os.path.join(cache_base_dir, "val")
+
+    if model_type == "fastspeech2" and isinstance(handler, FastSpeech2Handler):
+        f0_path = os.path.join(cache_base_dir, "f0_stats.json")
+        if os.path.isfile(f0_path):
+            with open(f0_path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            handler.set_f0_zscore_stats(st["mean"], st["std"])
+            print(f"📈 F0 z-score (Hz → normalizado) carregado de: {f0_path}")
+        else:
+            mxs = ds_cfg.get("f0_stats_max_train_samples", None)
+            handler.compute_f0_zscore_from_train_dataset(train_dataset, max_samples=mxs)
+            os.makedirs(cache_base_dir, exist_ok=True)
+            with open(f0_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mean": handler.f0_norm_mean,
+                        "std": handler.f0_norm_std,
+                        "version": FS2_F0_DATASET_VERSION,
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"💾 f0_stats.json salvo em: {f0_path}")
+        if handler.f0_norm_mean is not None and hasattr(handler.model, "set_f0_denorm"):
+            handler.model.set_f0_denorm(handler.f0_norm_mean, handler.f0_norm_std)
     
     if os.path.exists(train_cache_path):
         print(f"⚡ Carregando dataset TRAIN processado do cache: {train_cache_path}")
@@ -1133,64 +1414,174 @@ def main():
 
     # 7. Training
     train_params = ds_cfg['training']
-    effective_batch_size = train_params.get('batch_size', hw_cfg['batch_size'])
-    effective_grad_acc = train_params.get('gradient_accumulation_steps', hw_cfg['gradient_accumulation_steps'])
+    
+    # Prioridade de parâmetros:
+    # Se o usuário passar um perfil CUDA explicitamente via CLI, o Hardware Profile manda.
+    # Caso contrário, o Dataset Profile manda (para manter reprodutibilidade por modelo).
+    if args.profile and "cuda" in args.profile:
+        print(f"🎮 Modo Override Ativo: Usando Batch ({hw_cfg['batch_size']}) e GradAcc ({hw_cfg['gradient_accumulation_steps']}) do perfil {hw_profile}")
+        effective_batch_size = hw_cfg['batch_size']
+        effective_grad_acc = hw_cfg['gradient_accumulation_steps']
+    else:
+        effective_batch_size = train_params.get('batch_size', hw_cfg['batch_size'])
+        effective_grad_acc = train_params.get('gradient_accumulation_steps', hw_cfg['gradient_accumulation_steps'])
     effective_num_workers = train_params.get('dataloader_num_workers', 0)
     is_windows = os.name == "nt"
-    
+    if is_windows and effective_num_workers > 4:
+        print(
+            f"⚙️ Windows: dataloader_num_workers {effective_num_workers}→4 (spawn/IPC; subir manualmente se medires melhora).",
+        )
+        effective_num_workers = 4
+
+    # bf16: training.bf16 true força; false desliga; null ausente = herda hardware (ex. cuda_16gb.bf16: true)
+    _tpbf = train_params.get("bf16", None)
+    if _tpbf is True:
+        use_bf16 = device == "cuda"
+    elif _tpbf is False:
+        use_bf16 = False
+    else:
+        use_bf16 = bool(hw_cfg.get("bf16", False)) and device == "cuda"
+    if use_bf16:
+        print("🧮 bf16=True, fp16=False (ou dataset/hardware sem fp16)")
+
+    _gck = train_params.get("gradient_checkpointing", None)
+    if _gck is not None:
+        use_grad_ckpt = bool(_gck)
+    else:
+        use_grad_ckpt = bool(hw_cfg.get("gradient_checkpointing", False))
+    if use_grad_ckpt:
+        print("📎 gradient_checkpointing=True (reencaminhado p/ base/Peft; use_reentrant=False no kwargs)")
+
+    gbatch = effective_batch_size * effective_grad_acc
+    print(
+        f"📦 Lote efetivo: batch {effective_batch_size} × grad_acc {effective_grad_acc} = {gbatch} (menos acum. ⇒ menos overhead por passo, ex. 4 vs 8).",
+    )
+
+    _max_st = int(train_params.get("max_steps") or 0)
+    # None / omit = sem limite (guarda todos os checkpoint-*); inteiro N = manter no máximo N.
+    _stl = train_params.get("save_total_limit", None)
+    if _stl is not None and str(_stl).strip() != "":
+        _sv = int(_stl)
+        _save_limit = None if _sv <= 0 else max(1, _sv)  # 0 ou negativo = sem limite (como null)
+    else:
+        _save_limit = None
     training_kwargs = {
         "output_dir": out_dir,
         "per_device_train_batch_size": effective_batch_size,
         "gradient_accumulation_steps": effective_grad_acc,
-        "learning_rate": train_params['learning_rate'], 
+        "learning_rate": train_params['learning_rate'],
         "num_train_epochs": train_params['num_epochs'],
         "logging_steps": train_params['logging_steps'],
         "save_strategy": "steps",
         "save_steps": train_params['save_steps'], # Salvando a cada 10 épocas (aprox. 1750 passos com batch 4)
-        "save_total_limit": 1,
         "save_safetensors": False,
         "weight_decay": train_params.get('weight_decay', 0.0),
-        "fp16": hw_cfg['fp16'],
         "dataloader_num_workers": effective_num_workers,
+        "dataloader_pin_memory": device == "cuda",
         "remove_unused_columns": False,
         "report_to": "none",
         "max_grad_norm": 5.0 # Estabilizando gradientes para evitar saltos bruscos na Loss
     }
+    if _save_limit is not None:
+        training_kwargs["save_total_limit"] = _save_limit
+    if _max_st > 0:
+        training_kwargs["max_steps"] = _max_st
+        print(
+            f"🧭 max_steps={_max_st} (limita o treino a estes passos; útil c/ runs longos a partir de zero).",
+        )
+    if _save_limit is not None:
+        print(f"📁 Checkpoints: manter no máximo os últimos {_save_limit} (rotação no disco).")
+    else:
+        print("📁 Checkpoints: sem limite — todos os `checkpoint-*` no output_dir serão conservados.")
+    _wr = train_params.get("warmup_ratio", None)
+    if _wr is not None and float(_wr) > 0:
+        training_kwargs["warmup_ratio"] = float(_wr)
+    _lst = train_params.get("lr_scheduler_type", None)
+    if _lst is not None and str(_lst).strip():
+        training_kwargs["lr_scheduler_type"] = str(_lst).strip()
+    if use_bf16:
+        training_kwargs["bf16"] = True
+        training_kwargs["fp16"] = False
+    else:
+        _tpfp = train_params.get("fp16", None)
+        training_kwargs["fp16"] = _tpfp if _tpfp is not None else hw_cfg.get("fp16", False)
+
+    if use_grad_ckpt and device == "cuda":
+        training_kwargs["gradient_checkpointing"] = True
+        training_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
 
     # Ajuste de comportamento por sistema operacional.
     # No Linux, workers persistentes tendem a melhorar o throughput de input pipeline.
     # No Windows, manter desabilitado evita arestas com spawn em alguns cenários.
     if effective_num_workers > 0:
+        training_kwargs["dataloader_prefetch_factor"] = train_params.get("dataloader_prefetch_factor", 2)
         training_kwargs["dataloader_persistent_workers"] = not is_windows
 
     if processed_val_ds:
         training_kwargs["eval_strategy"] = "steps"
-        training_kwargs["eval_steps"] = train_params['logging_steps']
-        
+        # null/ausente: usa save_steps (menos overhead do que validar a cada logging_steps)
+        _es = train_params.get("eval_steps", None)
+        if _es is None:
+            _es = train_params.get("save_steps", train_params["logging_steps"])
+        training_kwargs["eval_steps"] = int(_es)
+        _nval = len(processed_val_ds)
+        _ls = train_params.get("logging_steps", 50)
+        print(
+            f"📊 Validação: {_nval} amostras no eval_dataset | "
+            f"eval a cada {training_kwargs['eval_steps']} passos (eval_steps no YAML = null → igual a save_steps) | "
+            f"log de treino a cada {_ls} passos (não confundir com eval).",
+        )
+    else:
+        print("⚠️ Sem dataset de validação: Trainer sem eval (só treino + save por save_steps se aplicável).")
+
     training_args = TrainingArguments(**training_kwargs)
+
+    cb = [TrainingETACallback(), ValidationCallback(), PeftAdapterSaveCallback(model)]
+    if _get_peft_model_for_save(model) is not None:
+        print("💾 Após cada save: adapter_config + adapter (PEFT) em checkpoint-* (além do state do Trainer).")
+    _baw = int(train_params.get("binary_align_warmup_steps", 0) or 0)
+    if _baw > 0 and model_type == "fastspeech2":
+        cb.append(BinaryAlignWarmupCallback(_baw, model_ref=model))
+        print(f"🔥 Binary align warmup: linear até passo ~{_baw} (1.0 = binário pleno)")
 
     trainer_kwargs = {
         "model": model, 
         "args": training_args, 
         "train_dataset": processed_train_ds, 
-        "eval_dataset": processed_val_ds, # Habilitando validação
+        "eval_dataset": processed_val_ds,
         "data_collator": handler.get_collator(),
-        "callbacks": [TrainingETACallback(), ValidationCallback()] # ETA + callback customizado
+        "callbacks": cb,
     }
-    
-    if processed_val_ds:
-        trainer_kwargs["eval_dataset"] = processed_val_ds
 
     trainer_kwargs["callbacks"].append(LogMetricsCallback())
     trainer = Trainer(**trainer_kwargs)
     
     # Configurar logging para incluir métricas customizadas como f0_rmse_hz
-    trainer.label_names = ["labels"] # Garante que o trainer aceite o dict de loss customizado
+    # Nome do tensor-alvo usado no eval: tem de bater com o collator (senão has_labels=False e não há eval_loss).
+    _label_for_eval = {
+        "fastspeech2": "y",
+        "glow_tts": "y",
+        "speecht5": "labels",
+        "f5_tts": "mel",
+        "xtts_v2": "audio_codes",
+        "matcha": "y",
+    }
+    if model_type in _label_for_eval:
+        trainer.label_names = [_label_for_eval[model_type]]
+    else:
+        trainer.label_names = None
 
     print("\n🏁 Iniciando Treinamento...")
-    if args.resume_from:
+    _trainer_resume = None
+    if args.resume_from and getattr(args, "resume_model_only", False):
+        print(f"🔄 Pesos a partir de (modelo): {args.resume_from}")
+        print(
+            "   ⚡ --resume_model_only: optimizer, scheduler e contador de passo recomeçam (treino 'novo' na pasta out_dir). "
+            "Use ao alterar target_modules/LoRA ou quando o state do otimizador deixa de bater com o modelo."
+        )
+    elif args.resume_from:
         print(f"🔄 Retomando treinamento a partir de: {args.resume_from}")
-        
+        _trainer_resume = args.resume_from
         # Patch para compatibilidade de versão do TrainerState
         # Remove chaves obsoletas como 'best_global_step' que causam erro no transformers 4.44+
         state_path = os.path.join(args.resume_from, "trainer_state.json")
@@ -1212,28 +1603,25 @@ def main():
             except Exception as e:
                 print(f"   ⚠️ Aviso ao aplicar patch no state: {e}")
     
-    trainer.train(resume_from_checkpoint=args.resume_from)
+    trainer.train(resume_from_checkpoint=_trainer_resume)
     
-    # 8. Saving Final Model
-    print("\n💾 Salvando modelo final...")
+    # 8. Saving: bundle PEFT (adapter_config + adapter) em out_dir; processor HF se houver; senão state genérico
+    print("\n💾 Salvando modelo final (adapter PEFT p/ inferência, quando aplicável)...")
     try:
-        saved = False
-        if hasattr(model, "save_pretrained"):
-            model.save_pretrained(out_dir)
-            saved = True
-        elif hasattr(model, "model") and hasattr(model.model, "save_pretrained"):
-            # Caso de wrappers (ex: FastSpeech2Wrapper) que encapsulam um PeftModel.
-            # Isso garante adapter_config.json + adapter_model.safetensors para inferência limpa.
-            model.model.save_pretrained(out_dir)
-            saved = True
+        if save_peft_adapter_for_inference(model, out_dir):
+            print("   ✅ adapter_config.json + adapter_model.* (PEFT) no diretório de saída")
+        else:
+            if hasattr(model, "save_pretrained"):
+                model.save_pretrained(out_dir)  # type: ignore[union-attr]
+            elif hasattr(model, "model") and hasattr(model.model, "save_pretrained"):
+                model.model.save_pretrained(out_dir)  # type: ignore[union-attr]
+            else:
+                trainer.save_model(out_dir)
 
-        if not saved:
-            trainer.save_model(out_dir)
-            
-        if hasattr(processor, "save_pretrained"):
+        if hasattr(processor, "save_pretrained") and processor is not None:
             processor.save_pretrained(out_dir)
-            
-        print(f"✅ Treinamento concluído com sucesso! Modelo final salvo em: {out_dir}")
+
+        print(f"✅ Treinamento concluído com sucesso! Pasta do run: {out_dir}")
     except Exception as e:
         print(f"⚠️ Atenção ao salvar modelo final: {e}")
         print("💡 Nota: Os checkpoints do treinamento (ex: checkpoint-3000) já foram salvos automaticamente pelo Trainer e podem ser utilizados!")
