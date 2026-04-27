@@ -328,7 +328,7 @@ def load_test_sentences_from_dataset(
     full_cfg: Dict,
     ds_cfg: Dict,
     dataset_name: str,
-    limit: int = 10,
+    limit: int = 5,
     seed: Optional[int] = None,
 ) -> List[str]:
     exported = load_test_sentences_from_exported_split(full_cfg, dataset_name, limit=limit, seed=seed)
@@ -480,12 +480,12 @@ class SpeechT5Inference(InferenceHandler):
         self.model.eval()
 
     def generate(self, text, speaker_emb, use_lora=True, **kwargs):
-        chunks = split_text_for_tts(text, max_chars=180)
+        chunks = split_text_for_tts(text, max_chars=100)
         chunk_audio = []
         chunk_silence = np.zeros(int(self.model_cfg.get("sampling_rate", 16000) * 0.12), dtype=np.float32)
 
         for idx, chunk in enumerate(chunks):
-            print(f"   (SpeechT5) Parte {idx + 1}/{len(chunks)}: {chunk[:45]}...")
+            print(f"   (SpeechT5) Parte {idx + 1}/{len(chunks)}: {chunk}...")
             inputs = self.processor(text=chunk, return_tensors="pt")
             with torch.no_grad():
                 if use_lora:
@@ -1094,7 +1094,8 @@ def main():
         "A qualidade do áudio melhorou significativamente após o ajuste fino.",
         "Estamos testando a comparação entre o modelo base e o modelo treinado.",
         "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
-        "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluida. Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto!",
+        "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluída... Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto.",
+        "Era uma vez um pequeno robô chamado Pip que vivia numa floresta de cristal onde as árvores tilintavam ao vento como sinos de vidro. Ele passava seus dias colecionando sons esquecidos. O suspiro de uma flor ao amanhecer, o ronco distante de um trovão tímido, o risinho abafado de um cogumelo quando a chuva fazia cócegas em seu chapéu. Até que certa manhã encontrou uma velhinha chamada Zara que carregava numa mala de couro uma única palavra que havia perdido em sonho, e Pip, com todo o carinho de seus circuitos dourados, abriu o peito e reproduziu o som exato, e a palavra voltou a existir, e a velhinha sorriu tão amplamente que as estrelas, mesmo sendo de dia, resolveram aparecer só pra ver.",
     ]
     
     test_texts = []
@@ -1105,7 +1106,7 @@ def main():
         full_cfg,
         ds_cfg,
         dataset_name,
-        limit=10,
+        limit=5,
         seed=args.test_text_seed,
     )
     test_texts = _merge_unique_texts(test_texts, default_texts, dataset_test_texts)
