@@ -18,3 +18,4 @@ soundfile
 tqdm
 speechbrain
 gruut-lang-pt
+pydub

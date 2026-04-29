@@ -26,6 +26,7 @@ output_cpu/
 output_mac/
 meus_datasets/*
 datasets/*
+aval_audios/
 scratch/
 *.wav
 

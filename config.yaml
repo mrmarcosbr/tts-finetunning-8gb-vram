@@ -27,10 +27,10 @@ hardware_profiles:
   cuda_16gb:
     device: "cuda"
     # Menos acumulação (4 vs 8) = menos micro-passos/optimizer, mesmo lote global ~128
-    batch_size: 64
-    gradient_accumulation_steps: 2
+    batch_size: 16
+    gradient_accumulation_steps: 4
     # RTX 30/40/50+: bf16 em geral sólido; com fp16=false. Dataset pode sobrepor com training.bf16: false
-    bf16: false
+    bf16: true
     fp16: false
     # Só true após testes; o Trainer reencaminha p/ o wrapper (e ao Peft se existir) — Coqui puro pode ignorar
     gradient_checkpointing: false
@@ -64,9 +64,11 @@ models:
     vocoder_id: "microsoft/speecht5_hifigan"
     speaker_encoder_id: "speechbrain/spkrec-xvect-voxceleb"
     lora:
-      r: 256
-      alpha: 512
-      dropout: 0.0
+      r: 64
+      alpha: 128
+      # LoRA igual rank no checkpoint (--resume_from): tensores continuam válidos quando alteras só dropout.
+      # Alterar rank requer mesmo r no YAML que no adapter salvo OU --resume_model_only (pesos novo rank).
+      dropout: 0.05
       target_modules: [ "q_proj", "k_proj", "v_proj", "out_proj" ]
 
   fastspeech2:
@@ -158,15 +160,44 @@ dataset_profiles:
       train_speakers: 28
       val_speakers: 3
       test_speakers: 4
+    # Sobrescreve campos de models.speecht5 só neste run (merge profundo em dict aninhados, ex.: lora).
+    # Para mudar só rank/target sem editar models.speecht5 globalmente, descomenta e ajusta (deve coincidir com o checkpoint se usar --resume_from sem --resume_model_only).
+    # model_overrides:
+    #   lora:
+    #     r: 128
+    #     alpha: 256
+    #     dropout: 0.05
     training:
-      # SpeechT5: com GPU ~16GB use --profile cuda_16gb_speecht5 (evita micro-batch 64 do cuda_16gb). Com ~8GB: --profile cuda_8gb.
+      # SpeechT5: ~16 GB → --profile cuda_16gb_speecht5 (evita micro-batch 64 do cuda_16gb). ~8 GB sentença a sentença → cuda_8gb.
+      # Com multi-frase (K>1) em ~8 GB usar cuda_8gb_speecht5 (batch menor + checkpointing).
       # Com --profile, batch/grad_acc vêm do hardware (ver hardware_profiles). Sem --profile, podes pôr batch_size e gradient_accumulation_steps aqui.
       learning_rate: 0.00001
-      num_epochs: 2500
-      weight_decay: 0.0
-      save_steps: 500
+      num_epochs: 4000
+      # Mantém corridas comparáveis ao run de referência (~10k passos); prioridade sobre num_epochs no Trainer.
+      max_steps: 16000
+      weight_decay: 0.01
+      warmup_ratio: 0.05
+      lr_scheduler_type: "cosine"
+      save_steps: 100
       logging_steps: 50
       save_total_limit: 0
+      eval_steps: null
+      dataloader_num_workers: 4
+      dataloader_prefetch_factor: 2
+      fp16: null
+      bf16: null
+      load_best_model_at_end: true
+      metric_for_best_model: "eval_loss"
+      greater_is_better: false
+      # --- SpeechT5: treino multi-frase (mesmo locutor) ---
+      # K=1: desligado. K>1: concatena texto com '. ' e áudio com gap (s); concat encodes x-vector no áudio fundido
+      # (recom. alinhado ao alvo mel); mean = média L2 dos x-vectors por clipe (sobrepõe prepare_item).
+      # Com K>1 em GPU 8 GB usa --profile cuda_8gb_speecht5; reduz dataloader workers (ex. 2) se RAM subir demais.
+      speecht5_train_spk_pool_size: 2
+      speecht5_train_spk_pool_mode: concat  # mean | concat
+      speecht5_train_spk_pool_gap_sec: 0.50
+      speecht5_train_spk_pool_seed: null    # int opcional; null = índices extra determinísticos
+      # Sugestões para segunda fase a partir de checkpoint forte (passo inicial): learning_rate mais baixo (ex. 3e-6), max_steps curto (+1500–3000).
 
   # GPU 8GB: use --profile cuda_8gb (sobrescreve batch/grad do hardware). O default abaixo mira 12–16GB.
   lapsbm_fastspeech2:

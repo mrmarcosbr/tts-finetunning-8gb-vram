@@ -40,15 +40,17 @@ torch.load = safe_load
 
 import json
 import yaml
+import random
 import torchaudio
 import unicodedata
 import argparse
+import copy
 import numpy as np
 import librosa
 import soundfile as sf
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union, Optional
-from collections import Counter
+from collections import Counter, defaultdict
 
 from datasets import load_dataset, Audio, Dataset, load_from_disk
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan, TrainerCallback
@@ -182,6 +184,139 @@ def extract_speaker_id(item):
 
     return "default"
 
+def join_speecht5_training_texts(sentence_parts: List[str]) -> str:
+    """Junta frases com '. ' (ponto + espaço) para simular encadeamento em falas longas."""
+    bits: List[str] = []
+    for p in sentence_parts:
+        s = str(p).strip()
+        if not s:
+            continue
+        s = s.rstrip().rstrip(".,; ")
+        if s:
+            bits.append(s)
+    if not bits:
+        return ""
+    return ". ".join(bits) + "."
+
+
+def _pick_train_spk_pool_indices(
+    anchor_idx: int,
+    peer_indices: List[int],
+    k: int,
+    rng: Optional[random.Random],
+) -> List[int]:
+    """Âncora incluída; restantes do mesmo locutor até k índices (únicos, ordenados por índice no dataset)."""
+    peers = sorted(set(int(x) for x in peer_indices))
+    if len(peers) <= k:
+        return peers
+    if anchor_idx not in peers:
+        anchor_idx = peers[0]
+    rest = [p for p in peers if p != anchor_idx]
+    if rng is not None:
+        rest = rest[:]
+        rng.shuffle(rest)
+    chosen = [int(anchor_idx)] + rest[: max(0, k - 1)]
+    return sorted(chosen[:k])
+
+
+def _speecht5_xvector_numpy(
+    y_1d: np.ndarray,
+    speaker_model: Any,
+) -> np.ndarray:
+    with torch.no_grad():
+        emb = speaker_model.encode_batch(torch.tensor(np.asarray(y_1d, dtype=np.float32).reshape(-1)))
+        v = torch.nn.functional.normalize(emb, dim=2).squeeze().cpu().numpy()
+    return np.asarray(v, dtype=np.float32).reshape(-1)
+
+
+def merge_speecht5_train_dataset_multi_sentence(
+    train_dataset: Dataset,
+    *,
+    pool_size: int,
+    pool_mode: str,
+    gap_sec: float,
+    seed: Optional[int],
+    target_sr: int,
+    speaker_model: Any,
+) -> Dataset:
+    """
+    Por cada linha de treino: agrupa até pool_size sentenças do mesmo locutor, concatena texto ('. ')
+    e áudio (silêncio curto entre clipes). pool_mode 'concat' => x-vector no prepare_item sobre o áudio
+    fundido; 'mean' => grava speaker_embedding_override (média dos x-vectors por clipe).
+    """
+    n = len(train_dataset)
+    if pool_size <= 1 or n == 0:
+        return train_dataset
+    mode = (pool_mode or "concat").strip().lower()
+    if mode not in ("mean", "concat"):
+        raise ValueError("speecht5_train_spk_pool_mode deve ser 'mean' ou 'concat'")
+
+    spk_to_idxs: Dict[str, List[int]] = defaultdict(list)
+    for idx in range(n):
+        row = train_dataset[idx]
+        spk = extract_speaker_id(row)
+        spk_to_idxs[spk].append(idx)
+    for spk in spk_to_idxs:
+        spk_to_idxs[spk] = sorted(spk_to_idxs[spk])
+
+    rng = random.Random(int(seed)) if seed is not None else None
+    gap_samples = int(max(0.0, float(gap_sec)) * target_sr)
+    gap = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else np.zeros(0, dtype=np.float32)
+
+    new_rows: List[Dict[str, Any]] = []
+    for i in range(n):
+        row_i = train_dataset[i]
+        spk = extract_speaker_id(row_i)
+        peers = spk_to_idxs.get(spk, [i])
+        pool_idx = _pick_train_spk_pool_indices(i, peers, pool_size, rng)
+        texts: List[str] = []
+        audio_pieces: List[np.ndarray] = []
+        seg_vecs: List[np.ndarray] = []
+        for j in pool_idx:
+            row = train_dataset[j]
+            t = row.get("text") or row.get("txt") or ""
+            texts.append(str(t))
+            au = row["audio"]
+            y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
+            audio_pieces.append(y)
+            if mode == "mean":
+                if speaker_model is None:
+                    raise RuntimeError(
+                        "speecht5_train_spk_pool_mode=mean requer speaker_encoder_id e modelo SpeechBrain carregado."
+                    )
+                seg_vecs.append(_speecht5_xvector_numpy(y, speaker_model))
+
+        merged_text = join_speecht5_training_texts(texts)
+        merged_parts: List[np.ndarray] = []
+        for pi, arr in enumerate(audio_pieces):
+            merged_parts.append(np.asarray(arr, dtype=np.float32).reshape(-1))
+            if pi < len(audio_pieces) - 1 and gap.size > 0:
+                merged_parts.append(gap.copy())
+        merged_audio = np.concatenate(merged_parts) if merged_parts else np.zeros(0, dtype=np.float32)
+
+        override: Optional[np.ndarray] = None
+        if mode == "mean" and seg_vecs:
+            st = np.stack(seg_vecs, axis=0)
+            m = st.mean(axis=0).astype(np.float32)
+            nrm = float(np.linalg.norm(m))
+            if nrm > 1e-12:
+                m = m / nrm
+            override = m
+
+        rec: Dict[str, Any] = {
+            "text": merged_text,
+            "audio": {"array": merged_audio.astype(np.float32), "sampling_rate": int(target_sr)},
+            "speaker_embedding_override": override,
+        }
+        new_rows.append(rec)
+
+    out = Dataset.from_list(new_rows)
+    print(
+        f"   🔀 SpeechT5 multi-frase: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
+        f"gap={gap_sec}s entre clipes | texto ligado com '. '."
+    )
+    return out.cast_column("audio", Audio(sampling_rate=int(target_sr)))
+
 def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
@@ -246,6 +381,37 @@ class ModelHandler:
     def get_collator(self):
         raise NotImplementedError()
 
+
+@dataclass
+class SpeechT5TTSDataCollatorWithPadding:
+    """
+    Tem de estar ao nível do módulo (não como classe local) para o DataLoader com
+    dataloader_num_workers>0 no Windows conseguir fazer pickle do collate_fn (spawn).
+    """
+
+    processor: Any
+
+    def __call__(self, features):
+        input_ids = [{"input_ids": feature["input_ids"]} for feature in features]
+        labels = [feature["labels"] for feature in features]
+        speaker_features = [feature["speaker_embeddings"] for feature in features]
+        batch = self.processor.pad(input_ids=input_ids, return_tensors="pt")
+        max_len = max([l.shape[0] for l in labels])
+        if max_len % 2 != 0:
+            max_len += 1
+        padded_labels = [
+            torch.nn.functional.pad(l, (0, 0, 0, max_len - l.shape[0]), value=-5.0) for l in labels
+        ]
+        batch["labels"] = torch.stack(padded_labels)
+        batch["speaker_embeddings"] = torch.stack(
+            [
+                s.clone().detach() if isinstance(s, torch.Tensor) else torch.tensor(s)
+                for s in speaker_features
+            ]
+        )
+        return batch
+
+
 class SpeechT5Handler(ModelHandler):
     def load(self, resume_from=None, resume_model_only=False):
         print(f"📥 Carregando SpeechT5: {self.model_cfg['id']}")
@@ -264,6 +430,33 @@ class SpeechT5Handler(ModelHandler):
         )
         
         has_adapter = resume_from and os.path.exists(os.path.join(resume_from, "adapter_config.json"))
+        ckpt_r: Optional[int] = None
+        if has_adapter:
+            cfg_path = os.path.join(resume_from, "adapter_config.json")
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as af:
+                    acfg = json.load(af)
+                ckpt_r = acfg.get("r")
+                if ckpt_r is None and isinstance(acfg.get("peft_config"), dict):
+                    ckpt_r = acfg["peft_config"].get("r")
+                if ckpt_r is not None:
+                    ckpt_r = int(ckpt_r)
+            except Exception as e:
+                print(f"   ⚠️ Não foi possível ler r do adapter checkpoint: {e}")
+        desired_r = int(lora_cfg["r"])
+        if has_adapter and ckpt_r is not None:
+            if resume_model_only and ckpt_r != desired_r:
+                print(
+                    f"   ⚡ Checkpoint LoRA r={ckpt_r}, config atual r={desired_r}. "
+                    f"--resume_model_only: tensores com shape incompatível serão ignorados (LoRA efectivamente novo nesse rank)."
+                )
+            elif not resume_model_only and ckpt_r != desired_r:
+                raise ValueError(
+                    f"Checkpoint LoRA tem r={ckpt_r}; o config atual pede r={desired_r}. "
+                    f"Tensores não são compatíveis para PeftModel.from_pretrained. Opções: (1) repor "
+                    f"models.speecht5.lora/model_overrides ao mesmo rank do checkpoint; ou (2) treinar novo rank com "
+                    f"--resume_model_only (pesos compatíveis carregados; novos filtros ficam aleatórios)."
+                )
         if has_adapter and not resume_model_only:
             print(f"🔄 Carregando adaptadores LoRA existentes de: {resume_from}")
             self.model = PeftModel.from_pretrained(self.model, resume_from, is_trainable=True)
@@ -299,6 +492,7 @@ class SpeechT5Handler(ModelHandler):
 
     def prepare_item(self, batch, processor, speaker_model, language=None):
         audio = batch["audio"]
+        override = batch.pop("speaker_embedding_override", None)
         clean_text = normalize_text(batch.get("text", "dummy"))
         batch["input_ids"] = processor(text=clean_text, return_tensors="pt").input_ids[0]
         y = np.array(audio["array"])
@@ -310,28 +504,23 @@ class SpeechT5Handler(ModelHandler):
         )
         log_mel = np.log10(np.clip(mel, 1e-5, None)).T
         batch["labels"] = torch.tensor(log_mel)
-        
-        with torch.no_grad():
-            emb = speaker_model.encode_batch(torch.tensor(y))
-            batch["speaker_embeddings"] = torch.nn.functional.normalize(emb, dim=2).squeeze().cpu().numpy()
+
+        used_override = False
+        if override is not None and speaker_model is not None:
+            ov = np.asarray(override, dtype=np.float32).reshape(-1)
+            if ov.size == 512:
+                batch["speaker_embeddings"] = ov
+                used_override = True
+        if not used_override:
+            if speaker_model is None:
+                raise RuntimeError("SpeechT5 prepare_item: speaker_model ausente e sem speaker_embedding_override.")
+            with torch.no_grad():
+                emb = speaker_model.encode_batch(torch.tensor(y))
+                batch["speaker_embeddings"] = torch.nn.functional.normalize(emb, dim=2).squeeze().cpu().numpy()
         return batch
 
     def get_collator(self):
-        @dataclass
-        class TTSDataCollatorWithPadding:
-            processor: Any
-            def __call__(self, features):
-                input_ids = [{"input_ids": feature["input_ids"]} for feature in features]
-                labels = [feature["labels"] for feature in features]
-                speaker_features = [feature["speaker_embeddings"] for feature in features]
-                batch = self.processor.pad(input_ids=input_ids, return_tensors="pt")
-                max_len = max([l.shape[0] for l in labels])
-                if max_len % 2 != 0: max_len += 1
-                padded_labels = [torch.nn.functional.pad(l, (0, 0, 0, max_len - l.shape[0]), value=-5.0) for l in labels]
-                batch["labels"] = torch.stack(padded_labels)
-                batch["speaker_embeddings"] = torch.stack([s.clone().detach() if isinstance(s, torch.Tensor) else torch.tensor(s) for s in speaker_features])
-                return batch
-        return TTSDataCollatorWithPadding(processor=self.processor)
+        return SpeechT5TTSDataCollatorWithPadding(processor=self.processor)
 
 # --- Placeholders para futuros Handlers ---
 class F5CFMWrapper(torch.nn.Module):
@@ -1032,6 +1221,25 @@ class GenericSOTAHandler(ModelHandler):
         print(f"⚠️ O modelo {self.model_cfg['id']} requer implementações customizadas.")
         sys.exit(1)
 
+def merge_dataset_model_overrides(model_cfg: Dict, ds_cfg: Dict) -> Dict:
+    """Mescla `dataset_profiles[*].model_overrides` sobre cópia de `models.<model_type>` (ex.: lora)."""
+    base = copy.deepcopy(model_cfg)
+    overrides = ds_cfg.get("model_overrides") if isinstance(ds_cfg.get("model_overrides"), dict) else None
+    if not overrides:
+        return base
+    for key, val in overrides.items():
+        cur = base.get(key)
+        if isinstance(val, dict) and isinstance(cur, dict):
+            merged = dict(cur)
+            merged.update(val)
+            base[key] = merged
+            print(f"   📎 model_overrides (dataset): '{key}' mesclado → {merged}")
+        else:
+            base[key] = val
+            print(f"   📎 model_overrides (dataset): '{key}' = {val}")
+    return base
+
+
 def get_handler(model_type, model_cfg, device):
     if model_type == 'speecht5':
         return SpeechT5Handler(model_cfg, device)
@@ -1170,19 +1378,20 @@ def main():
         print(f"❌ Modelo '{model_type}' não definido no YAML.")
         sys.exit(1)
     
-    model_cfg = full_cfg['models'][model_type]
-    
+    model_cfg = merge_dataset_model_overrides(full_cfg["models"][model_type], ds_cfg)
+
     # 2. Hardware
     hw_profile = args.profile or detect_hardware_profile(full_cfg)
     hw_cfg = full_cfg['hardware_profiles'].get(hw_profile, full_cfg['hardware_profiles']['cpu'])
     device = hw_cfg.get('device', 'cpu')
     
-    # O wrapper FastPitch força o forward do Coqui em FP32 (autocast off); TF32 + cudnn aliviam custo nessa parte.
+    # TF32 acelera matmul em FP32 (Ampere+). cudnn.benchmark escolhe algoritmos conv para o tamanho de lote actual.
+    # Com bf16/fp16 no HuggingFace Trainer, o passo de treino do modelo usa precisão mista onde o autocast aplicar.
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
         print(
-            "🚀 CUDA: TF32 em matmul FP32 + cudnn.benchmark=True (forward TTS/aligner fica em FP32; o Trainer pode usar half no resto se fp16=on).",
+            "🚀 CUDA: matmul TF32 (high) + cudnn.benchmark=True; Trainer usa bf16/fp16 quando activos no perfil/YAML.",
         )
 
     if model_type == 'f5_tts' and device == 'cuda' and hw_cfg['batch_size'] > 2:
@@ -1339,6 +1548,8 @@ def main():
     with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
         json.dump(split_info, f, indent=4)
         
+    train_params = ds_cfg.get("training") or {}
+
     # Configurar Sampling Rate
     target_sr = model_cfg.get('sampling_rate', 16000)
     train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=target_sr))
@@ -1356,13 +1567,55 @@ def main():
         )
     
     language = ds_cfg.get("language", "pt")
+
+    _pool_sz = 1
+    _pool_md = "concat"
+    _pool_gap = 0.25
+    _pool_sd = None
+    if model_type == "speecht5":
+        _pool_sz = int(train_params.get("speecht5_train_spk_pool_size", 1) or 1)
+        _pool_md = str(train_params.get("speecht5_train_spk_pool_mode", "concat")).strip().lower()
+        _pool_gap = float(train_params.get("speecht5_train_spk_pool_gap_sec", 0.25))
+        _pool_sd = train_params.get("speecht5_train_spk_pool_seed", None)
+        if _pool_sz > 1:
+            if _pool_md not in ("mean", "concat"):
+                print(f"❌ speecht5_train_spk_pool_mode inválido: {_pool_md!r} (use mean ou concat).")
+                sys.exit(1)
+            if _pool_md == "mean" and speaker_model is None:
+                print("❌ speecht5_train_spk_pool_mode=mean requer speaker_encoder_id em models.speecht5.")
+                sys.exit(1)
+            print(
+                f"   📎 Multi-frase treino: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
+                f"(seed={_pool_sd!r}) — só train; val permanece sentença-a-sentença."
+            )
+            train_dataset = merge_speecht5_train_dataset_multi_sentence(
+                train_dataset,
+                pool_size=_pool_sz,
+                pool_mode=_pool_md,
+                gap_sec=_pool_gap,
+                seed=int(_pool_sd) if _pool_sd is not None else None,
+                target_sr=target_sr,
+                speaker_model=speaker_model,
+            )
+            split_info["counts"]["train_samples"] = len(train_dataset)
+            split_info["speecht5_train_spk_pool"] = {
+                "pool_size": _pool_sz,
+                "mode": _pool_md,
+                "gap_sec": _pool_gap,
+                "seed": _pool_sd,
+            }
+            with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+                json.dump(split_info, f, indent=4)
     
     # Sistema de Cache Hard (Disco) — sufixo fs2 força recache ao mudar F0 (f0zscore_v1, etc.)
     _fs2_cache_suffix = f"_{FS2_F0_DATASET_VERSION}" if model_type == "fastspeech2" else ""
+    _spk_pool_cache = ""
+    if model_type == "speecht5" and _pool_sz > 1:
+        _spk_pool_cache = f"_spkpool{_pool_sz}_{_pool_md}_g{_pool_gap}_sd{_pool_sd}"
     cache_base_dir = os.path.join(
         full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'),
         "cache_processado",
-        f"{model_type}_{dataset_name}_{target_sr}hz{_fs2_cache_suffix}",
+        f"{model_type}_{dataset_name}_{target_sr}hz{_fs2_cache_suffix}{_spk_pool_cache}",
     )
     train_cache_path = os.path.join(cache_base_dir, "train")
     val_cache_path = os.path.join(cache_base_dir, "val")
@@ -1413,7 +1666,7 @@ def main():
             print(f"💾 Cache VAL salvo em: {val_cache_path}")
 
     # 7. Training
-    train_params = ds_cfg['training']
+    # train_params já definido (secção cache / multi-frase SpeechT5)
     
     # Prioridade de parâmetros:
     # Se o usuário passar um perfil CUDA explicitamente via CLI, o Hardware Profile manda.
@@ -1533,6 +1786,18 @@ def main():
         )
     else:
         print("⚠️ Sem dataset de validação: Trainer sem eval (só treino + save por save_steps se aplicável).")
+
+    _lb = train_params.get("load_best_model_at_end", None)
+    if _lb is True and processed_val_ds:
+        training_kwargs["load_best_model_at_end"] = True
+        training_kwargs["metric_for_best_model"] = str(train_params.get("metric_for_best_model", "eval_loss"))
+        training_kwargs["greater_is_better"] = bool(train_params.get("greater_is_better", False))
+        print(
+            f"📌 load_best_model_at_end=True métrica={training_kwargs['metric_for_best_model']} "
+            f"greater_is_better={training_kwargs['greater_is_better']}",
+        )
+    elif _lb is True and not processed_val_ds:
+        print("⚠️ load_best_model_at_end omitido — sem eval_dataset.")
 
     training_args = TrainingArguments(**training_kwargs)
 
