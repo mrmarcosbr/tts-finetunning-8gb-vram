@@ -38,6 +38,7 @@ import re
 import unicodedata
 import argparse
 import csv
+import json
 import soundfile as sf
 import librosa
 import numpy as np
@@ -311,20 +312,96 @@ def write_per_sentence_transcripts_and_tsv(
     print(f"   📄 Transcrições por sentença: {os.path.basename(out_dir)}/*.txt + {os.path.basename(tsv_path)}")
 
 
+def save_speecht5_reference_run_extras(
+    out_dir: str,
+    *,
+    prefix: str,
+    text_raw: str,
+    p_refs_wav: str,
+    speaker_model: Optional[Any],
+    encoder_sr: int,
+    device: str,
+    manifest_rows: List[Dict[str, Any]],
+) -> None:
+    """
+    Dentro da pasta de inferência: referencia_embeddings (*.npy + manifest acumulado em manifest_rows),
+    referencia_sentencas (*.txt), referencia_wav (cópia só do .wav na raiz — ignora .mp3).
+    O x-vector é calculado apenas a partir do ficheiro *_referencia.wav (1 WAV = 1 embedding; sem áudio
+    agregado nem mistura do pool usado no gen_spk).
+    """
+    root = Path(out_dir)
+    emb_dir = root / "referencia_embeddings"
+    txt_dir = root / "referencia_sentencas"
+    wav_dir = root / "referencia_wav"
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    txt_dir.mkdir(parents=True, exist_ok=True)
+    wav_dir.mkdir(parents=True, exist_ok=True)
+
+    row: Dict[str, Any] = {
+        "prefix": prefix,
+        "root_referencia_wav": os.path.basename(p_refs_wav),
+    }
+
+    src = Path(p_refs_wav)
+    y_from_wav: Optional[np.ndarray] = None
+    sr_from_wav: Optional[int] = None
+    if src.is_file() and src.suffix.lower() == ".wav":
+        try:
+            y_lr, sr_lr = librosa.load(str(src), sr=None, mono=True)
+            y_from_wav = np.asarray(y_lr, dtype=np.float32).reshape(-1)
+            sr_from_wav = int(sr_lr)
+        except Exception:
+            y_from_wav = None
+            sr_from_wav = None
+
+    if speaker_model is not None and y_from_wav is not None and y_from_wav.size > 0 and sr_from_wav is not None:
+        ref_t = speecht5_speaker_embedding_from_numpy(
+            y_from_wav, sr_from_wav, int(encoder_sr), speaker_model, device
+        )
+        vec = ref_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        emb_name = f"{prefix}_referencia_emb.npy"
+        np.save(str(emb_dir / emb_name), vec)
+        row["embedding_npy"] = emb_name
+        row["shape"] = [int(vec.shape[0])]
+        row["embedding_source"] = os.path.basename(p_refs_wav)
+    else:
+        row["embedding_npy"] = None
+        if speaker_model is None:
+            row["note"] = "sem SpeechBrain encoder"
+        elif not src.is_file() or src.suffix.lower() != ".wav":
+            row["note"] = "falta *_referencia.wav (só .wav é usado para x-vector e cópia)"
+        else:
+            row["note"] = "falha ao ler WAV de referência ou sinal vazio"
+
+    body = (text_raw or "").strip()
+    txt_name = f"{prefix}.txt"
+    (txt_dir / txt_name).write_text(body + "\n" if body else "", encoding="utf-8")
+    row["sentenca_txt"] = txt_name
+
+    if src.is_file() and src.suffix.lower() == ".wav":
+        dst_name = f"{prefix}_referencia.wav"
+        shutil.copy2(src, wav_dir / dst_name)
+        row["referencia_wav_subfolder"] = dst_name
+    manifest_rows.append(row)
+
+
 def copy_treinado_wavs_to_subfolder(out_dir: str, subfolder: str = "treinado_wav") -> int:
-    """Cria `out_dir/subfolder` com cópias dos WAV cujo nome casa com *_treinado.wav (só no nível da pasta de inferência)."""
+    """Cria `out_dir/subfolder` com cópias só dos .wav `*_treinado.wav` na raiz (ignora .mp3 e outros)."""
     root = Path(out_dir)
     if not root.is_dir():
         return 0
     dest = root / subfolder
     dest.mkdir(parents=True, exist_ok=True)
     n = 0
-    for src in sorted(root.glob("*_treinado.wav")):
-        if src.is_file():
-            shutil.copy2(src, dest / src.name)
-            n += 1
+    for src in sorted(root.glob("*_treinado.*")):
+        if not src.is_file() or src.suffix.lower() != ".wav":
+            continue
+        if not src.stem.lower().endswith("_treinado"):
+            continue
+        shutil.copy2(src, dest / src.name)
+        n += 1
     if n:
-        print(f"   📁 Cópias *_treinado.wav → {dest} ({n} ficheiro(s))")
+        print(f"   📁 Cópias só *_treinado.wav → {dest} ({n} ficheiro(s); .mp3 ignorados)")
     return n
 
 
@@ -789,6 +866,54 @@ def _merge_unique_texts(*groups: List[str]) -> List[str]:
             seen.add(key)
             merged.append(raw)
     return merged
+
+
+def load_test_exported_embedding_cycle(embed_dir: str, device: str) -> Tuple[List[str], List[torch.Tensor]]:
+    """Carrega spk_*.npy (512-D) na ordem de manifest.test_speakers ou M031…M034."""
+    root = Path(embed_dir)
+    if not root.is_dir():
+        print(f"❌ --use-test-embeddings: pasta inexistente: {root.resolve()}", file=sys.stderr)
+        sys.exit(1)
+    order: List[str] = ["M031", "M032", "M033", "M034"]
+    manifest_path = root / "manifest.json"
+    npy_names: List[str] = []
+    if manifest_path.is_file():
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+        order = list(data.get("test_speakers") or order)
+        spk_info = data.get("speakers") or {}
+        for spk in order:
+            info = spk_info.get(spk) or {}
+            npy_names.append(str(info.get("npy") or f"spk_{spk}.npy"))
+    else:
+        for spk in order:
+            npy_names.append(f"spk_{spk}.npy")
+    tensors: List[torch.Tensor] = []
+    for fn in npy_names:
+        path = root / fn
+        if not path.is_file():
+            print(f"❌ --use-test-embeddings: falta {path.resolve()}", file=sys.stderr)
+            sys.exit(1)
+        arr = np.load(str(path), allow_pickle=False).astype(np.float32).reshape(-1)
+        if arr.size != 512:
+            print(f"❌ {path.name}: esperado vetor 512-D, shape={arr.shape}", file=sys.stderr)
+            sys.exit(1)
+        tensors.append(torch.from_numpy(arr.copy()).unsqueeze(0).to(device=device, dtype=torch.float32))
+    return order, tensors
+
+
+def _default_texts_prefix_alignment_mask(test_texts: List[str], defaults_unique: List[str]) -> List[bool]:
+    """True em i só se test_texts[i] coincidir com o i-ésimo default após _merge_unique_texts(default_texts)."""
+    out: List[bool] = []
+    for i in range(len(test_texts)):
+        ok = (
+            i < len(defaults_unique)
+            and normalize_text((test_texts[i] or "").strip())
+            == normalize_text((defaults_unique[i] or "").strip())
+        )
+        out.append(ok)
+    return out
+
 
 def _random_pick_texts(texts: List[str], limit: int, seed: Optional[int] = None) -> List[str]:
     clean_unique = _merge_unique_texts(texts)
@@ -1675,6 +1800,22 @@ def main():
         help="Seed opcional para tornar reproduzível a seleção das sentenças de teste.",
     )
     parser.add_argument(
+        "--use-test-embeddings",
+        action="store_true",
+        dest="use_test_embeddings",
+        help=(
+            "SpeechT5: linhas alinhadas ao prefixo default_texts (ordem _merge_unique_texts só dos defaults) "
+            "usam x-vectors em --use-test-embeddings-dir (ciclo: 1→M031, 2→M032, 3→M033, 4→M034, 5→M031, …)."
+        ),
+    )
+    parser.add_argument(
+        "--use-test-embeddings-dir",
+        type=str,
+        default="./embeddings_test_speakers",
+        dest="use_test_embeddings_dir",
+        help="Pasta com manifest.json + spk_*.npy (export_test_speaker_embeddings.py).",
+    )
+    parser.add_argument(
         "--trained_bass_cut_hz",
         type=float,
         default=120.0,
@@ -2097,13 +2238,19 @@ def main():
 
     # 3. Preparar lista de textos
     default_texts = [
+        "Em dois mil e vinte e cinco, a taxa caiu de doze virgula cinco por cento para nove virgula oito por cento.",
+        "O doutor Silva atende na avenida Paulista, no apartamento mil duzentos e tres.",
+        "Eu preciso levar a colher para colher as ervas.",
+        "A equipe validou os dados antes de iniciar os experimentos.",
+        "Voce confirmou se o arquivo de audio esta correto",
+        "Que otima noticia, o treinamento terminou sem erros",
         "O treinamento exaustivo foi finalizado com sucesso.",
         "Esta é uma demonstração de voz gerada por inteligência artificial.",
-        "A qualidade do áudio melhorou significativamente após o ajuste fino.",
-        "Estamos testando a comparação entre o modelo base e o modelo treinado.",
-        "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
-        "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluída... Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto.",
-        "Era uma vez um pequeno robô chamado Pip que vivia numa floresta de cristal onde as árvores tilintavam ao vento como sinos de vidro. Ele passava seus dias colecionando sons esquecidos. O suspiro de uma flor ao amanhecer, o ronco distante de um trovão tímido, o risinho abafado de um cogumelo quando a chuva fazia cócegas em seu chapéu. Até que certa manhã encontrou uma velhinha chamada Zara que carregava numa mala de couro uma única palavra que havia perdido em sonho, e Pip, com todo o carinho de seus circuitos dourados, abriu o peito e reproduziu o som exato, e a palavra voltou a existir, e a velhinha sorriu tão amplamente que as estrelas, mesmo sendo de dia, resolveram aparecer só pra ver.",
+        # "A qualidade do áudio melhorou significativamente após o ajuste fino.",
+        # "Estamos testando a comparação entre o modelo base e o modelo treinado.",
+        # "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
+        # "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluída... Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto.",
+        # "Era uma vez um pequeno robô chamado Pip que vivia numa floresta de cristal onde as árvores tilintavam ao vento como sinos de vidro. Ele passava seus dias colecionando sons esquecidos. O suspiro de uma flor ao amanhecer, o ronco distante de um trovão tímido, o risinho abafado de um cogumelo quando a chuva fazia cócegas em seu chapéu. Até que certa manhã encontrou uma velhinha chamada Zara que carregava numa mala de couro uma única palavra que havia perdido em sonho, e Pip, com todo o carinho de seus circuitos dourados, abriu o peito e reproduziu o som exato, e a palavra voltou a existir, e a velhinha sorriu tão amplamente que as estrelas, mesmo sendo de dia, resolveram aparecer só pra ver.",
     ]
     
     dataset_test_limit = getattr(args, "dataset_sentence_limit", 5)
@@ -2254,6 +2401,30 @@ def main():
         )
         test_texts = _merge_unique_texts([], default_texts, dataset_test_texts)
 
+    defaults_unique_for_emb = _merge_unique_texts(default_texts)
+    test_exported_emb_apply: Optional[List[bool]] = None
+    test_exported_emb_order: List[str] = []
+    test_exported_emb_tensors: List[torch.Tensor] = []
+    test_exported_emb_counter = 0
+    if getattr(args, "use_test_embeddings", False):
+        if model_type != "speecht5":
+            print(
+                "⚠️ --use-test-embeddings só aplica a SpeechT5; flag ignorada para este modelo.",
+                file=sys.stderr,
+            )
+        else:
+            test_exported_emb_order, test_exported_emb_tensors = load_test_exported_embedding_cycle(
+                str(args.use_test_embeddings_dir),
+                device,
+            )
+            test_exported_emb_apply = _default_texts_prefix_alignment_mask(test_texts, defaults_unique_for_emb)
+            _nh = sum(test_exported_emb_apply)
+            print(
+                f"   📎 --use-test-embeddings ({args.use_test_embeddings_dir}): "
+                f"locutores ciclo = {test_exported_emb_order} | "
+                f"{_nh} linha(s) com condicionamento .npy (prefixo default_texts)."
+            )
+
     # 4. Criar pasta de saída
     type_str = "custom" if args.text else "batch"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2361,6 +2532,11 @@ def main():
         "also_mp3": not getattr(args, "no_mp3", False),
         "mp3_bitrate": getattr(args, "mp3_bitrate", "192k"),
     }
+    ref_extra_manifest: List[Dict[str, Any]] = []
+    speecht5_encoder_id_str = str(
+        model_cfg.get("speaker_encoder_id", "speechbrain/spkrec-xvect-voxceleb")
+    )
+    speecht5_encoder_sr = int(model_cfg.get("sampling_rate", 16000))
 
     # 5. Executar Inferência
     for i, text in enumerate(test_texts):
@@ -2384,7 +2560,23 @@ def main():
 
         gen_spk = speaker_emb
         if model_type == "speecht5":
-            if getattr(args, "speecht5_zero_speaker_embedding", False):
+            exported_npy_this_row = (
+                getattr(args, "use_test_embeddings", False)
+                and test_exported_emb_apply is not None
+                and i < len(test_exported_emb_apply)
+                and test_exported_emb_apply[i]
+            )
+            if exported_npy_this_row:
+                s_ix = test_exported_emb_counter % len(test_exported_emb_order)
+                gen_spk = test_exported_emb_tensors[s_ix]
+                spk_lab = test_exported_emb_order[s_ix]
+                print(
+                    f"   🔊 Speaker conditioning: x-vector exportado {spk_lab} "
+                    f"(--use-test-embeddings; uso #{test_exported_emb_counter + 1} no ciclo "
+                    f"{test_exported_emb_order})"
+                )
+                test_exported_emb_counter += 1
+            elif getattr(args, "speecht5_zero_speaker_embedding", False):
                 gen_spk = torch.zeros((1, 512), dtype=torch.float32, device=device)
                 print(
                     "   🔊 Speaker conditioning: vetor zero (--speecht5_zero_speaker_embedding); "
@@ -2547,6 +2739,17 @@ def main():
                         p_refs = os.path.join(out_dir, f"{prefix}_referencia.wav")
                         write_wav_and_mp3(p_refs, np.asarray(ya, dtype=np.float32), int(sra), **_mp3_kw)
                         _wav_report(p_refs, ya, int(sra))
+                        if model_type == "speecht5":
+                            save_speecht5_reference_run_extras(
+                                out_dir,
+                                prefix=prefix,
+                                text_raw=text,
+                                p_refs_wav=p_refs,
+                                speaker_model=speecht5_speaker_model,
+                                encoder_sr=speecht5_encoder_sr,
+                                device=device,
+                                manifest_rows=ref_extra_manifest,
+                            )
                     elif getattr(args, "dataset_reference_audios", False):
                         print(
                             "      ⚠️ WAV de referência não gravado "
@@ -2601,6 +2804,28 @@ def main():
             print(f"      📄 {out_csv}")
         else:
             print("\n   ⚠️ compute_f0_rmse: sem pares *_original.wav / *_treinado.wav nesta pasta.")
+
+    if model_type == "speecht5" and ref_extra_manifest:
+        man_path = os.path.join(out_dir, "referencia_embeddings", "manifest.json")
+        with open(man_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "speaker_encoder_id": speecht5_encoder_id_str,
+                    "encoder_sampling_rate_hz": speecht5_encoder_sr,
+                    "n_entries": len(ref_extra_manifest),
+                    "entries": ref_extra_manifest,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        n_emb = sum(1 for e in ref_extra_manifest if e.get("embedding_npy"))
+        print(
+            f"\n   📎 Referência organizada: referencia_embeddings/ ({n_emb} x-vector .npy + manifest.json) | "
+            f"referencia_sentencas/ ({len(ref_extra_manifest)} .txt) | "
+            f"referencia_wav/ ({len(ref_extra_manifest)} .wav)"
+        )
+        print(f"      📄 {man_path}")
 
     copy_treinado_wavs_to_subfolder(out_dir)
 

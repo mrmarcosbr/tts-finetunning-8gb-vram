@@ -229,6 +229,18 @@ def _speecht5_xvector_numpy(
     return np.asarray(v, dtype=np.float32).reshape(-1)
 
 
+def _speecht5_train_row_as_single_record(row: Dict[str, Any], target_sr: int) -> Dict[str, Any]:
+    """Uma sentença, um áudio; prepare_item calcula o x-vector no encode_batch (sem override)."""
+    au = row["audio"]
+    y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
+    t = row.get("text") or row.get("txt") or ""
+    return {
+        "text": str(t),
+        "audio": {"array": y.astype(np.float32), "sampling_rate": int(target_sr)},
+        "speaker_embedding_override": None,
+    }
+
+
 def merge_speecht5_train_dataset_multi_sentence(
     train_dataset: Dataset,
     *,
@@ -238,15 +250,24 @@ def merge_speecht5_train_dataset_multi_sentence(
     seed: Optional[int],
     target_sr: int,
     speaker_model: Any,
+    multi_sample_fraction: float = 1.0,
 ) -> Dataset:
     """
     Por cada linha de treino: agrupa até pool_size sentenças do mesmo locutor, concatena texto ('. ')
     e áudio (silêncio curto entre clipes). pool_mode 'concat' => x-vector no prepare_item sobre o áudio
     fundido; 'mean' => grava speaker_embedding_override (média dos x-vectors por clipe).
+
+    multi_sample_fraction no intervalo [0, 1]: fração de linhas que passam por este agregador multi-frase;
+    o restante mantém transcrição + áudio de uma só sentença (comportamento tradicional).
+    1.0 = comportamento anterior (100% multi). 0 = não chamar esta função (caller deixa dataset intacto).
     """
     n = len(train_dataset)
     if pool_size <= 1 or n == 0:
         return train_dataset
+    mf = max(0.0, min(1.0, float(multi_sample_fraction)))
+    if mf <= 0.0:
+        return train_dataset
+
     mode = (pool_mode or "concat").strip().lower()
     if mode not in ("mean", "concat"):
         raise ValueError("speecht5_train_spk_pool_mode deve ser 'mean' ou 'concat'")
@@ -259,16 +280,35 @@ def merge_speecht5_train_dataset_multi_sentence(
     for spk in spk_to_idxs:
         spk_to_idxs[spk] = sorted(spk_to_idxs[spk])
 
-    rng = random.Random(int(seed)) if seed is not None else None
+    # mf == 1.0: mesmo critério que antes — rng None se seed null (sem shuffle dos peers extras).
+    rng_pool: Optional[random.Random] = random.Random(int(seed)) if seed is not None else None
+    rng_mix: Optional[random.Random] = None
+    if mf < 1.0:
+        rng_mix = random.Random(int(seed)) if seed is not None else random.Random()
+
     gap_samples = int(max(0.0, float(gap_sec)) * target_sr)
     gap = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else np.zeros(0, dtype=np.float32)
 
     new_rows: List[Dict[str, Any]] = []
+    n_multi = 0
+    n_single = 0
     for i in range(n):
+        use_multi = mf >= 1.0 or (rng_mix is not None and rng_mix.random() < mf)
+        if not use_multi:
+            new_rows.append(_speecht5_train_row_as_single_record(train_dataset[i], target_sr))
+            n_single += 1
+            continue
+
+        n_multi += 1
         row_i = train_dataset[i]
         spk = extract_speaker_id(row_i)
         peers = spk_to_idxs.get(spk, [i])
-        pool_idx = _pick_train_spk_pool_indices(i, peers, pool_size, rng)
+        pool_idx = _pick_train_spk_pool_indices(
+            i,
+            peers,
+            pool_size,
+            rng_pool if mf >= 1.0 else rng_mix,
+        )
         texts: List[str] = []
         audio_pieces: List[np.ndarray] = []
         seg_vecs: List[np.ndarray] = []
@@ -297,11 +337,11 @@ def merge_speecht5_train_dataset_multi_sentence(
         override: Optional[np.ndarray] = None
         if mode == "mean" and seg_vecs:
             st = np.stack(seg_vecs, axis=0)
-            m = st.mean(axis=0).astype(np.float32)
-            nrm = float(np.linalg.norm(m))
+            mvec = st.mean(axis=0).astype(np.float32)
+            nrm = float(np.linalg.norm(mvec))
             if nrm > 1e-12:
-                m = m / nrm
-            override = m
+                mvec = mvec / nrm
+            override = mvec
 
         rec: Dict[str, Any] = {
             "text": merged_text,
@@ -311,9 +351,14 @@ def merge_speecht5_train_dataset_multi_sentence(
         new_rows.append(rec)
 
     out = Dataset.from_list(new_rows)
+    mix_note = (
+        f" | mistura: {100.0 * mf:.1f}% multi (≈{n_multi} linhas) + {n_single} single"
+        if mf < 1.0
+        else ""
+    )
     print(
         f"   🔀 SpeechT5 multi-frase: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
-        f"gap={gap_sec}s entre clipes | texto ligado com '. '."
+        f"gap={gap_sec}s entre clipes{mix_note} | texto multi ligado com '. '."
     )
     return out.cast_column("audio", Audio(sampling_rate=int(target_sr)))
 
@@ -1572,11 +1617,13 @@ def main():
     _pool_md = "concat"
     _pool_gap = 0.25
     _pool_sd = None
+    _pool_multi_frac = 1.0
     if model_type == "speecht5":
         _pool_sz = int(train_params.get("speecht5_train_spk_pool_size", 1) or 1)
         _pool_md = str(train_params.get("speecht5_train_spk_pool_mode", "concat")).strip().lower()
         _pool_gap = float(train_params.get("speecht5_train_spk_pool_gap_sec", 0.25))
         _pool_sd = train_params.get("speecht5_train_spk_pool_seed", None)
+        _pool_multi_frac = max(0.0, min(1.0, float(train_params.get("speecht5_train_spk_pool_multi_fraction", 1.0))))
         if _pool_sz > 1:
             if _pool_md not in ("mean", "concat"):
                 print(f"❌ speecht5_train_spk_pool_mode inválido: {_pool_md!r} (use mean ou concat).")
@@ -1584,34 +1631,56 @@ def main():
             if _pool_md == "mean" and speaker_model is None:
                 print("❌ speecht5_train_spk_pool_mode=mean requer speaker_encoder_id em models.speecht5.")
                 sys.exit(1)
-            print(
-                f"   📎 Multi-frase treino: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
-                f"(seed={_pool_sd!r}) — só train; val permanece sentença-a-sentença."
-            )
-            train_dataset = merge_speecht5_train_dataset_multi_sentence(
-                train_dataset,
-                pool_size=_pool_sz,
-                pool_mode=_pool_md,
-                gap_sec=_pool_gap,
-                seed=int(_pool_sd) if _pool_sd is not None else None,
-                target_sr=target_sr,
-                speaker_model=speaker_model,
-            )
-            split_info["counts"]["train_samples"] = len(train_dataset)
-            split_info["speecht5_train_spk_pool"] = {
-                "pool_size": _pool_sz,
-                "mode": _pool_md,
-                "gap_sec": _pool_gap,
-                "seed": _pool_sd,
-            }
-            with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
-                json.dump(split_info, f, indent=4)
+            if _pool_multi_frac <= 0.0:
+                print(
+                    f"   📎 Multi-frase desactivada (speecht5_train_spk_pool_multi_fraction=0): "
+                    f"treino 100% single apesar de K={_pool_sz} na config."
+                )
+                split_info["speecht5_train_spk_pool"] = {
+                    "pool_size": _pool_sz,
+                    "mode": _pool_md,
+                    "gap_sec": _pool_gap,
+                    "seed": _pool_sd,
+                    "multi_fraction": 0.0,
+                    "merged_train": False,
+                }
+                with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+                    json.dump(split_info, f, indent=4)
+            else:
+                print(
+                    f"   📎 Multi-frase treino: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
+                    f"(seed={_pool_sd!r}), fração multi={_pool_multi_frac:.1%} — só train; "
+                    "val permanece sentença-a-sentença."
+                )
+                train_dataset = merge_speecht5_train_dataset_multi_sentence(
+                    train_dataset,
+                    pool_size=_pool_sz,
+                    pool_mode=_pool_md,
+                    gap_sec=_pool_gap,
+                    seed=int(_pool_sd) if _pool_sd is not None else None,
+                    target_sr=target_sr,
+                    speaker_model=speaker_model,
+                    multi_sample_fraction=_pool_multi_frac,
+                )
+                split_info["counts"]["train_samples"] = len(train_dataset)
+                split_info["speecht5_train_spk_pool"] = {
+                    "pool_size": _pool_sz,
+                    "mode": _pool_md,
+                    "gap_sec": _pool_gap,
+                    "seed": _pool_sd,
+                    "multi_fraction": _pool_multi_frac,
+                    "merged_train": True,
+                }
+                with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+                    json.dump(split_info, f, indent=4)
     
     # Sistema de Cache Hard (Disco) — sufixo fs2 força recache ao mudar F0 (f0zscore_v1, etc.)
     _fs2_cache_suffix = f"_{FS2_F0_DATASET_VERSION}" if model_type == "fastspeech2" else ""
     _spk_pool_cache = ""
-    if model_type == "speecht5" and _pool_sz > 1:
+    if model_type == "speecht5" and _pool_sz > 1 and _pool_multi_frac > 0:
         _spk_pool_cache = f"_spkpool{_pool_sz}_{_pool_md}_g{_pool_gap}_sd{_pool_sd}"
+        if _pool_multi_frac < 1.0:
+            _spk_pool_cache += f"_mf{int(round(_pool_multi_frac * 100))}"
     cache_base_dir = os.path.join(
         full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'),
         "cache_processado",

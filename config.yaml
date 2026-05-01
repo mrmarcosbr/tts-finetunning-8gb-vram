@@ -193,9 +193,12 @@ dataset_profiles:
       # K=1: desligado. K>1: concatena texto com '. ' e áudio com gap (s); concat encodes x-vector no áudio fundido
       # (recom. alinhado ao alvo mel); mean = média L2 dos x-vectors por clipe (sobrepõe prepare_item).
       # Com K>1 em GPU 8 GB usa --profile cuda_8gb_speecht5; reduz dataloader workers (ex. 2) se RAM subir demais.
+      # speecht5_train_spk_pool_multi_fraction: 0.5 ≈ 50% amostras multi (concat/mean conforme modo) + 50% single tradicional.
+      # 1.0 = 100% multi (comportamento antigo). 0 = nunca funde (treino só single, apesar de K>1 na config).
+      speecht5_train_spk_pool_multi_fraction: 0.3
       speecht5_train_spk_pool_size: 2
       speecht5_train_spk_pool_mode: concat  # mean | concat
-      speecht5_train_spk_pool_gap_sec: 0.50
+      speecht5_train_spk_pool_gap_sec: 0.25
       speecht5_train_spk_pool_seed: null    # int opcional; null = índices extra determinísticos
       # Sugestões para segunda fase a partir de checkpoint forte (passo inicial): learning_rate mais baixo (ex. 3e-6), max_steps curto (+1500–3000).
 

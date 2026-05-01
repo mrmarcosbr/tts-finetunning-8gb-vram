@@ -1,0 +1,90 @@
+{
+  "dataset_profile": "lapsbm_speecht5",
+  "speaker_encoder_id": "speechbrain/spkrec-xvect-voxceleb",
+  "target_sr": 16000,
+  "aggregate": "first",
+  "test_speakers": [
+    "M031",
+    "M032",
+    "M033",
+    "M034"
+  ],
+  "speakers": {
+    "M031": {
+      "npy": "spk_M031.npy",
+      "n_utts_used": 1,
+      "indices": [
+        620
+      ],
+      "dataset_index": 620,
+      "audio_source": "hf://datasets/falabrasil/lapsbm@7f11b2475de614bea20dc8d083d9493560947961/data/test/LapsBM-M031/LapsBM-M031.tar.gz",
+      "clip_n_samples": 73709,
+      "clip_sample_rate_hz": 16000,
+      "clip_duration_sec": 4.6068,
+      "exported_clips": [
+        {
+          "wav": "spk_M031_idx620.wav",
+          "txt": "spk_M031_idx620.txt",
+          "dataset_index": 620
+        }
+      ]
+    },
+    "M032": {
+      "npy": "spk_M032.npy",
+      "n_utts_used": 1,
+      "indices": [
+        640
+      ],
+      "dataset_index": 640,
+      "audio_source": "hf://datasets/falabrasil/lapsbm@7f11b2475de614bea20dc8d083d9493560947961/data/test/LapsBM-M032/LapsBM-M032.tar.gz",
+      "clip_n_samples": 70979,
+      "clip_sample_rate_hz": 16000,
+      "clip_duration_sec": 4.4362,
+      "exported_clips": [
+        {
+          "wav": "spk_M032_idx640.wav",
+          "txt": "spk_M032_idx640.txt",
+          "dataset_index": 640
+        }
+      ]
+    },
+    "M033": {
+      "npy": "spk_M033.npy",
+      "n_utts_used": 1,
+      "indices": [
+        660
+      ],
+      "dataset_index": 660,
+      "audio_source": "hf://datasets/falabrasil/lapsbm@7f11b2475de614bea20dc8d083d9493560947961/data/test/LapsBM-M033/LapsBM-M033.tar.gz",
+      "clip_n_samples": 54594,
+      "clip_sample_rate_hz": 16000,
+      "clip_duration_sec": 3.4121,
+      "exported_clips": [
+        {
+          "wav": "spk_M033_idx660.wav",
+          "txt": "spk_M033_idx660.txt",
+          "dataset_index": 660
+        }
+      ]
+    },
+    "M034": {
+      "npy": "spk_M034.npy",
+      "n_utts_used": 1,
+      "indices": [
+        680
+      ],
+      "dataset_index": 680,
+      "audio_source": "hf://datasets/falabrasil/lapsbm@7f11b2475de614bea20dc8d083d9493560947961/data/test/LapsBM-M034/LapsBM-M034.tar.gz",
+      "clip_n_samples": 59338,
+      "clip_sample_rate_hz": 16000,
+      "clip_duration_sec": 3.7086,
+      "exported_clips": [
+        {
+          "wav": "spk_M034_idx680.wav",
+          "txt": "spk_M034_idx680.txt",
+          "dataset_index": 680
+        }
+      ]
+    }
+  }
+}
