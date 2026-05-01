@@ -27,7 +27,7 @@ hardware_profiles:
   cuda_16gb:
     device: "cuda"
     # Menos acumulação (4 vs 8) = menos micro-passos/optimizer, mesmo lote global ~128
-    batch_size: 16
+    batch_size: 32
     gradient_accumulation_steps: 4
     # RTX 30/40/50+: bf16 em geral sólido; com fp16=false. Dataset pode sobrepor com training.bf16: false
     bf16: true
@@ -193,9 +193,16 @@ dataset_profiles:
       # K=1: desligado. K>1: concatena texto com '. ' e áudio com gap (s); concat encodes x-vector no áudio fundido
       # (recom. alinhado ao alvo mel); mean = média L2 dos x-vectors por clipe (sobrepõe prepare_item).
       # Com K>1 em GPU 8 GB usa --profile cuda_8gb_speecht5; reduz dataloader workers (ex. 2) se RAM subir demais.
+      # speecht5_train_spk_pool_mix_mode: "replace" | "append"
+      #   replace — multi_sample_fraction = probabilidade Bernoulli por linha (mantém cardinalidade ~n).
+      #   append — mantém as n linhas como single e acrescenta round(n * append_multi_ratio) linhas multi
+      #     (ex.: ratio 1.0 ⇒ n+n; 0.5 ⇒ n + n/2). Embaralhamento final (seed+100003 se seed definido).
+      speecht5_train_spk_pool_mix_mode: append
+      speecht5_train_spk_pool_append_multi_ratio: 0.4
+      # --- REPLACE: fração multi por linha (~30% multi + ~70% single quando 0.3). Ignorado em append.
       # speecht5_train_spk_pool_multi_fraction: 0.5 ≈ 50% amostras multi (concat/mean conforme modo) + 50% single tradicional.
       # 1.0 = 100% multi (comportamento antigo). 0 = nunca funde (treino só single, apesar de K>1 na config).
-      speecht5_train_spk_pool_multi_fraction: 0.3
+      speecht5_train_spk_pool_multi_fraction: 0.3 # irrelevante em append; mantido para voltares a replace sem editar tudo
       speecht5_train_spk_pool_size: 2
       speecht5_train_spk_pool_mode: concat  # mean | concat
       speecht5_train_spk_pool_gap_sec: 0.25

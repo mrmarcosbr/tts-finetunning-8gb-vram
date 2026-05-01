@@ -65,6 +65,30 @@ def _device_for_speechbrain(device: str) -> str:
     return device
 
 
+def _speecht5_zero_decoder_layerdrop_for_guided_attention(model: torch.nn.Module) -> None:
+    """
+    O SpeechT5Decoder copia decoder_layerdrop para self.layerdrop no __init__; o forward usa self.layerdrop.
+    Só alterar config.decoder_layerdrop não desativa o LayerDrop — causa cross_attentions vazio e falha no loss.
+    """
+    inner = model
+    if hasattr(inner, "get_base_model"):
+        try:
+            inner = inner.get_base_model()
+        except Exception:
+            pass
+    cfg = getattr(inner, "config", None)
+    if cfg is None or not getattr(cfg, "use_guided_attention_loss", False):
+        return
+    dec_mod = getattr(getattr(inner, "speecht5", None), "decoder", None)
+    wrapped = getattr(dec_mod, "wrapped_decoder", None) if dec_mod is not None else None
+    drop_cfg = float(getattr(cfg, "decoder_layerdrop", 0.0) or 0.0)
+    drop_mod = float(getattr(wrapped, "layerdrop", 0.0) or 0.0) if wrapped is not None else 0.0
+    if drop_cfg > 0.0 or drop_mod > 0.0:
+        cfg.decoder_layerdrop = 0.0
+        if wrapped is not None and hasattr(wrapped, "layerdrop"):
+            wrapped.layerdrop = 0.0
+
+
 def _get_peft_model_for_save(model) -> Optional[PeftModel]:
     """Encontra o PeftModel embutido (wrapper FS2, SpeechT5, XTTS.gpt, Glow-TTS .encoder, etc.)."""
     if isinstance(model, PeftModel):
@@ -95,6 +119,25 @@ def save_peft_adapter_for_inference(model, out_dir: str) -> bool:
     except (ImportError, OSError, TypeError, ValueError):
         peft.save_pretrained(out_dir, safe_serialization=False)
     return True
+
+
+class SpeechT5GuidedAttentionLayerdropCallback(TrainerCallback):
+    """
+    Garante decoder_layerdrop efetivo a 0 quando há guided attention (ver _speecht5_zero_decoder_layerdrop_*).
+
+    on_train_begin: após Trainer.load_adapter no resume.
+    on_step_begin: evita que layerdrop volte a >0 durante o treino (p.ex. referência antiga ou ordem de init);
+    o forward do SpeechT5Decoder usa self.layerdrop copiado no __init__, não o config.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self._model = model
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        _speecht5_zero_decoder_layerdrop_for_guided_attention(self._model)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        _speecht5_zero_decoder_layerdrop_for_guided_attention(self._model)
 
 
 class PeftAdapterSaveCallback(TrainerCallback):
@@ -241,6 +284,68 @@ def _speecht5_train_row_as_single_record(row: Dict[str, Any], target_sr: int) ->
     }
 
 
+def _speecht5_build_multi_record(
+    train_dataset: Dataset,
+    anchor_idx: int,
+    spk_to_idxs: Dict[str, List[int]],
+    pool_size: int,
+    rng_pool: Optional[random.Random],
+    pool_mode: str,
+    gap: np.ndarray,
+    target_sr: int,
+    speaker_model: Any,
+) -> Dict[str, Any]:
+    """Uma linha de treino multi: âncora + até pool_size−1 pares do mesmo locutor."""
+    row_i = train_dataset[anchor_idx]
+    spk = extract_speaker_id(row_i)
+    peers = spk_to_idxs.get(spk, [anchor_idx])
+    pool_idx = _pick_train_spk_pool_indices(
+        anchor_idx,
+        peers,
+        pool_size,
+        rng_pool,
+    )
+    texts: List[str] = []
+    audio_pieces: List[np.ndarray] = []
+    seg_vecs: List[np.ndarray] = []
+    for j in pool_idx:
+        row = train_dataset[j]
+        t = row.get("text") or row.get("txt") or ""
+        texts.append(str(t))
+        au = row["audio"]
+        y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
+        audio_pieces.append(y)
+        if pool_mode == "mean":
+            if speaker_model is None:
+                raise RuntimeError(
+                    "speecht5_train_spk_pool_mode=mean requer speaker_encoder_id e modelo SpeechBrain carregado."
+                )
+            seg_vecs.append(_speecht5_xvector_numpy(y, speaker_model))
+
+    merged_text = join_speecht5_training_texts(texts)
+    merged_parts: List[np.ndarray] = []
+    for pi, arr in enumerate(audio_pieces):
+        merged_parts.append(np.asarray(arr, dtype=np.float32).reshape(-1))
+        if pi < len(audio_pieces) - 1 and gap.size > 0:
+            merged_parts.append(gap.copy())
+    merged_audio = np.concatenate(merged_parts) if merged_parts else np.zeros(0, dtype=np.float32)
+
+    override: Optional[np.ndarray] = None
+    if pool_mode == "mean" and seg_vecs:
+        st = np.stack(seg_vecs, axis=0)
+        mvec = st.mean(axis=0).astype(np.float32)
+        nrm = float(np.linalg.norm(mvec))
+        if nrm > 1e-12:
+            mvec = mvec / nrm
+        override = mvec
+
+    return {
+        "text": merged_text,
+        "audio": {"array": merged_audio.astype(np.float32), "sampling_rate": int(target_sr)},
+        "speaker_embedding_override": override,
+    }
+
+
 def merge_speecht5_train_dataset_multi_sentence(
     train_dataset: Dataset,
     *,
@@ -251,21 +356,24 @@ def merge_speecht5_train_dataset_multi_sentence(
     target_sr: int,
     speaker_model: Any,
     multi_sample_fraction: float = 1.0,
+    mix_mode: str = "replace",
+    append_multi_ratio: float = 1.0,
 ) -> Dataset:
     """
-    Por cada linha de treino: agrupa até pool_size sentenças do mesmo locutor, concatena texto ('. ')
-    e áudio (silêncio curto entre clipes). pool_mode 'concat' => x-vector no prepare_item sobre o áudio
-    fundido; 'mean' => grava speaker_embedding_override (média dos x-vectors por clipe).
+    Agrupa amostras multi-frase (mesmo locutor), texto com '. ' e áudio com gap.
 
-    multi_sample_fraction no intervalo [0, 1]: fração de linhas que passam por este agregador multi-frase;
-    o restante mantém transcrição + áudio de uma só sentença (comportamento tradicional).
-    1.0 = comportamento anterior (100% multi). 0 = não chamar esta função (caller deixa dataset intacto).
+    mix_mode 'replace' (padrão): em cada linha i, com probabilidade multi_sample_fraction
+    substitui por multi; senão single. mf=0.3 ⇒ ~30% multi + ~70% single; n linhas no total.
+
+    mix_mode 'append': mantém as n linhas originais como single e acrescenta k linhas multi,
+    com k = round(n * append_multi_ratio). Ex.: n=560 e append_multi_ratio=1.0 ⇒ 560+560=1120;
+    ratio=0.5 ⇒ 560+280=840. Âncoras das k multis: t % n para t=0..k−1.
+
+    pool_mode 'concat' ⇒ x-vector no prepare_item sobre o áudio fundido; 'mean' ⇒ média L2
+    dos x-vectors por clipe em speaker_embedding_override.
     """
     n = len(train_dataset)
     if pool_size <= 1 or n == 0:
-        return train_dataset
-    mf = max(0.0, min(1.0, float(multi_sample_fraction)))
-    if mf <= 0.0:
         return train_dataset
 
     mode = (pool_mode or "concat").strip().lower()
@@ -280,14 +388,58 @@ def merge_speecht5_train_dataset_multi_sentence(
     for spk in spk_to_idxs:
         spk_to_idxs[spk] = sorted(spk_to_idxs[spk])
 
-    # mf == 1.0: mesmo critério que antes — rng None se seed null (sem shuffle dos peers extras).
+    gap_samples = int(max(0.0, float(gap_sec)) * target_sr)
+    gap = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else np.zeros(0, dtype=np.float32)
+
+    mm = (mix_mode or "replace").strip().lower()
+    if mm not in ("replace", "append"):
+        raise ValueError("speecht5_train_spk_pool_mix_mode deve ser 'replace' ou 'append'")
+
     rng_pool: Optional[random.Random] = random.Random(int(seed)) if seed is not None else None
+
+    if mm == "append":
+        ar = max(0.0, float(append_multi_ratio))
+        k = int(round(n * ar))
+        singles = [_speecht5_train_row_as_single_record(train_dataset[i], target_sr) for i in range(n)]
+        if k <= 0:
+            print(
+                f"   🔀 SpeechT5 append multi: ratio={ar:g} ⇒ 0 extras; dataset inalterado ({n} amostras)."
+            )
+            return train_dataset
+        multi_rows = [
+            _speecht5_build_multi_record(
+                train_dataset,
+                t % n,
+                spk_to_idxs,
+                pool_size,
+                rng_pool,
+                mode,
+                gap,
+                target_sr,
+                speaker_model,
+            )
+            for t in range(k)
+        ]
+        new_rows = singles + multi_rows
+        if seed is not None:
+            rng_shuf = random.Random(int(seed) + 100003)
+            rng_shuf.shuffle(new_rows)
+        else:
+            random.shuffle(new_rows)
+        print(
+            f"   🔀 SpeechT5 multi-frase APPEND: {n} single + {k} multi → {len(new_rows)} amostras | "
+            f"K={pool_size} modo={mode} | gap={gap_sec}s | append_multi_ratio={ar:g} (k=round(n×ratio))."
+        )
+        out = Dataset.from_list(new_rows)
+        return out.cast_column("audio", Audio(sampling_rate=int(target_sr)))
+
+    mf = max(0.0, min(1.0, float(multi_sample_fraction)))
+    if mf <= 0.0:
+        return train_dataset
+
     rng_mix: Optional[random.Random] = None
     if mf < 1.0:
         rng_mix = random.Random(int(seed)) if seed is not None else random.Random()
-
-    gap_samples = int(max(0.0, float(gap_sec)) * target_sr)
-    gap = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else np.zeros(0, dtype=np.float32)
 
     new_rows: List[Dict[str, Any]] = []
     n_multi = 0
@@ -300,67 +452,32 @@ def merge_speecht5_train_dataset_multi_sentence(
             continue
 
         n_multi += 1
-        row_i = train_dataset[i]
-        spk = extract_speaker_id(row_i)
-        peers = spk_to_idxs.get(spk, [i])
-        pool_idx = _pick_train_spk_pool_indices(
-            i,
-            peers,
-            pool_size,
-            rng_pool if mf >= 1.0 else rng_mix,
+        new_rows.append(
+            _speecht5_build_multi_record(
+                train_dataset,
+                i,
+                spk_to_idxs,
+                pool_size,
+                rng_pool if mf >= 1.0 else rng_mix,
+                mode,
+                gap,
+                target_sr,
+                speaker_model,
+            )
         )
-        texts: List[str] = []
-        audio_pieces: List[np.ndarray] = []
-        seg_vecs: List[np.ndarray] = []
-        for j in pool_idx:
-            row = train_dataset[j]
-            t = row.get("text") or row.get("txt") or ""
-            texts.append(str(t))
-            au = row["audio"]
-            y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
-            audio_pieces.append(y)
-            if mode == "mean":
-                if speaker_model is None:
-                    raise RuntimeError(
-                        "speecht5_train_spk_pool_mode=mean requer speaker_encoder_id e modelo SpeechBrain carregado."
-                    )
-                seg_vecs.append(_speecht5_xvector_numpy(y, speaker_model))
-
-        merged_text = join_speecht5_training_texts(texts)
-        merged_parts: List[np.ndarray] = []
-        for pi, arr in enumerate(audio_pieces):
-            merged_parts.append(np.asarray(arr, dtype=np.float32).reshape(-1))
-            if pi < len(audio_pieces) - 1 and gap.size > 0:
-                merged_parts.append(gap.copy())
-        merged_audio = np.concatenate(merged_parts) if merged_parts else np.zeros(0, dtype=np.float32)
-
-        override: Optional[np.ndarray] = None
-        if mode == "mean" and seg_vecs:
-            st = np.stack(seg_vecs, axis=0)
-            mvec = st.mean(axis=0).astype(np.float32)
-            nrm = float(np.linalg.norm(mvec))
-            if nrm > 1e-12:
-                mvec = mvec / nrm
-            override = mvec
-
-        rec: Dict[str, Any] = {
-            "text": merged_text,
-            "audio": {"array": merged_audio.astype(np.float32), "sampling_rate": int(target_sr)},
-            "speaker_embedding_override": override,
-        }
-        new_rows.append(rec)
 
     out = Dataset.from_list(new_rows)
     mix_note = (
-        f" | mistura: {100.0 * mf:.1f}% multi (≈{n_multi} linhas) + {n_single} single"
+        f" | mistura replace: {100.0 * mf:.1f}% multi (≈{n_multi} linhas) + {n_single} single"
         if mf < 1.0
         else ""
     )
     print(
-        f"   🔀 SpeechT5 multi-frase: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
+        f"   🔀 SpeechT5 multi-frase REPLACE: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
         f"gap={gap_sec}s entre clipes{mix_note} | texto multi ligado com '. '."
     )
     return out.cast_column("audio", Audio(sampling_rate=int(target_sr)))
+
 
 def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -445,7 +562,9 @@ class SpeechT5TTSDataCollatorWithPadding:
         if max_len % 2 != 0:
             max_len += 1
         padded_labels = [
-            torch.nn.functional.pad(l, (0, 0, 0, max_len - l.shape[0]), value=-5.0) for l in labels
+            # SpeechT5SpectrogramLoss (HF) usa padding_mask = labels != -100.0; outro valor (−5) contamina
+            # o L1/BCE em regiões padeadas — com batches mistos curto+longo (mix multi/single) piora muito.
+            torch.nn.functional.pad(l, (0, 0, 0, max_len - l.shape[0]), value=-100.0) for l in labels
         ]
         batch["labels"] = torch.stack(padded_labels)
         batch["speaker_embeddings"] = torch.stack(
@@ -461,7 +580,10 @@ class SpeechT5Handler(ModelHandler):
     def load(self, resume_from=None, resume_model_only=False):
         print(f"📥 Carregando SpeechT5: {self.model_cfg['id']}")
         self.processor = SpeechT5Processor.from_pretrained(self.model_cfg['id'])
-        self.vocoder = SpeechT5HifiGan.from_pretrained(self.model_cfg['vocoder_id']).to(self.device)
+        # Treino (mel + loss) não usa o vocoder no forward; carregar em GPU só desperdiça VRAM (~centenas MB–1GB+).
+        self.vocoder = SpeechT5HifiGan.from_pretrained(self.model_cfg["vocoder_id"]) #.to(self.device)
+        self.vocoder.eval()
+        self.vocoder = self.vocoder.to("cpu")
         
         SpeechT5ForTextToSpeech._keys_to_ignore_on_load_unexpected = [r'.*encode_positions\.pe']
         self.model = SpeechT5ForTextToSpeech.from_pretrained(self.model_cfg['id'])
@@ -532,7 +654,24 @@ class SpeechT5Handler(ModelHandler):
             if not p.is_contiguous(): p.data = p.data.contiguous()
         for b in self.model.buffers():
             if not b.is_contiguous(): b.data = b.data.contiguous()
-            
+
+        _m = self.model
+        _inner = _m.get_base_model() if hasattr(_m, "get_base_model") else _m
+        drop_cfg_before = float(getattr(getattr(_inner, "config", None), "decoder_layerdrop", 0.0) or 0.0)
+        _wd = getattr(
+            getattr(getattr(_inner, "speecht5", None), "decoder", None),
+            "wrapped_decoder",
+            None,
+        )
+        drop_mod_before = float(getattr(_wd, "layerdrop", 0.0) or 0.0) if _wd is not None else 0.0
+        _speecht5_zero_decoder_layerdrop_for_guided_attention(self.model)
+        if getattr(getattr(_inner, "config", None), "use_guided_attention_loss", False) and (
+            drop_cfg_before > 0 or drop_mod_before > 0
+        ):
+            print(
+                f"   ℹ️ Guided attention: decoder_layerdrop config={drop_cfg_before} módulo.layerdrop={drop_mod_before} → 0"
+            )
+
         return self.model, self.processor
 
     def prepare_item(self, batch, processor, speaker_model, language=None):
@@ -1618,12 +1757,16 @@ def main():
     _pool_gap = 0.25
     _pool_sd = None
     _pool_multi_frac = 1.0
+    _pool_mix_mode = "replace"
+    _pool_append_ratio = 1.0
     if model_type == "speecht5":
         _pool_sz = int(train_params.get("speecht5_train_spk_pool_size", 1) or 1)
         _pool_md = str(train_params.get("speecht5_train_spk_pool_mode", "concat")).strip().lower()
         _pool_gap = float(train_params.get("speecht5_train_spk_pool_gap_sec", 0.25))
         _pool_sd = train_params.get("speecht5_train_spk_pool_seed", None)
         _pool_multi_frac = max(0.0, min(1.0, float(train_params.get("speecht5_train_spk_pool_multi_fraction", 1.0))))
+        _pool_mix_mode = str(train_params.get("speecht5_train_spk_pool_mix_mode", "replace")).strip().lower()
+        _pool_append_ratio = max(0.0, float(train_params.get("speecht5_train_spk_pool_append_multi_ratio", 1.0)))
         if _pool_sz > 1:
             if _pool_md not in ("mean", "concat"):
                 print(f"❌ speecht5_train_spk_pool_mode inválido: {_pool_md!r} (use mean ou concat).")
@@ -1631,7 +1774,61 @@ def main():
             if _pool_md == "mean" and speaker_model is None:
                 print("❌ speecht5_train_spk_pool_mode=mean requer speaker_encoder_id em models.speecht5.")
                 sys.exit(1)
-            if _pool_multi_frac <= 0.0:
+            if _pool_mix_mode not in ("replace", "append"):
+                print(
+                    f"❌ speecht5_train_spk_pool_mix_mode inválido: {_pool_mix_mode!r} "
+                    f"(use 'replace' ou 'append')."
+                )
+                sys.exit(1)
+
+            if _pool_mix_mode == "append":
+                if _pool_append_ratio <= 0.0:
+                    print(
+                        f"   📎 speecht5_train_spk_pool_append_multi_ratio=0: sem linhas multi extra; "
+                        f"treino com dataset original ({len(train_dataset)} amostras), apesar de K={_pool_sz}."
+                    )
+                    split_info["speecht5_train_spk_pool"] = {
+                        "pool_size": _pool_sz,
+                        "mode": _pool_md,
+                        "gap_sec": _pool_gap,
+                        "seed": _pool_sd,
+                        "mix_mode": "append",
+                        "append_multi_ratio": 0.0,
+                        "merged_train": False,
+                    }
+                    with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+                        json.dump(split_info, f, indent=4)
+                else:
+                    print(
+                        f"   📎 Multi-frase APPEND: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s (seed={_pool_sd!r}), "
+                        f"append_multi_ratio={_pool_append_ratio:g} ⇒ +round(n×ratio) linhas multi — só train; "
+                        "val permanece sentença-a-sentença."
+                    )
+                    train_dataset = merge_speecht5_train_dataset_multi_sentence(
+                        train_dataset,
+                        pool_size=_pool_sz,
+                        pool_mode=_pool_md,
+                        gap_sec=_pool_gap,
+                        seed=int(_pool_sd) if _pool_sd is not None else None,
+                        target_sr=target_sr,
+                        speaker_model=speaker_model,
+                        multi_sample_fraction=_pool_multi_frac,
+                        mix_mode="append",
+                        append_multi_ratio=_pool_append_ratio,
+                    )
+                    split_info["counts"]["train_samples"] = len(train_dataset)
+                    split_info["speecht5_train_spk_pool"] = {
+                        "pool_size": _pool_sz,
+                        "mode": _pool_md,
+                        "gap_sec": _pool_gap,
+                        "seed": _pool_sd,
+                        "mix_mode": "append",
+                        "append_multi_ratio": _pool_append_ratio,
+                        "merged_train": True,
+                    }
+                    with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+                        json.dump(split_info, f, indent=4)
+            elif _pool_multi_frac <= 0.0:
                 print(
                     f"   📎 Multi-frase desactivada (speecht5_train_spk_pool_multi_fraction=0): "
                     f"treino 100% single apesar de K={_pool_sz} na config."
@@ -1641,6 +1838,7 @@ def main():
                     "mode": _pool_md,
                     "gap_sec": _pool_gap,
                     "seed": _pool_sd,
+                    "mix_mode": "replace",
                     "multi_fraction": 0.0,
                     "merged_train": False,
                 }
@@ -1648,8 +1846,8 @@ def main():
                     json.dump(split_info, f, indent=4)
             else:
                 print(
-                    f"   📎 Multi-frase treino: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
-                    f"(seed={_pool_sd!r}), fração multi={_pool_multi_frac:.1%} — só train; "
+                    f"   📎 Multi-frase REPLACE: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
+                    f"(seed={_pool_sd!r}), multi_fraction={_pool_multi_frac:.1%} (Bernoulli por linha) — só train; "
                     "val permanece sentença-a-sentença."
                 )
                 train_dataset = merge_speecht5_train_dataset_multi_sentence(
@@ -1661,6 +1859,8 @@ def main():
                     target_sr=target_sr,
                     speaker_model=speaker_model,
                     multi_sample_fraction=_pool_multi_frac,
+                    mix_mode="replace",
+                    append_multi_ratio=1.0,
                 )
                 split_info["counts"]["train_samples"] = len(train_dataset)
                 split_info["speecht5_train_spk_pool"] = {
@@ -1668,6 +1868,7 @@ def main():
                     "mode": _pool_md,
                     "gap_sec": _pool_gap,
                     "seed": _pool_sd,
+                    "mix_mode": "replace",
                     "multi_fraction": _pool_multi_frac,
                     "merged_train": True,
                 }
@@ -1677,10 +1878,16 @@ def main():
     # Sistema de Cache Hard (Disco) — sufixo fs2 força recache ao mudar F0 (f0zscore_v1, etc.)
     _fs2_cache_suffix = f"_{FS2_F0_DATASET_VERSION}" if model_type == "fastspeech2" else ""
     _spk_pool_cache = ""
-    if model_type == "speecht5" and _pool_sz > 1 and _pool_multi_frac > 0:
-        _spk_pool_cache = f"_spkpool{_pool_sz}_{_pool_md}_g{_pool_gap}_sd{_pool_sd}"
-        if _pool_multi_frac < 1.0:
-            _spk_pool_cache += f"_mf{int(round(_pool_multi_frac * 100))}"
+    if model_type == "speecht5" and _pool_sz > 1:
+        _use_spk_pool_cache = (_pool_mix_mode == "append" and _pool_append_ratio > 0) or (
+            _pool_mix_mode == "replace" and _pool_multi_frac > 0
+        )
+        if _use_spk_pool_cache:
+            _spk_pool_cache = f"_spkpool{_pool_sz}_{_pool_md}_g{_pool_gap}_sd{_pool_sd}"
+            if _pool_mix_mode == "append":
+                _spk_pool_cache += f"_mixappend_r{int(round(_pool_append_ratio * 100))}"
+            elif _pool_mix_mode == "replace" and _pool_multi_frac < 1.0:
+                _spk_pool_cache += f"_mf{int(round(_pool_multi_frac * 100))}"
     cache_base_dir = os.path.join(
         full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'),
         "cache_processado",
@@ -1871,6 +2078,8 @@ def main():
     training_args = TrainingArguments(**training_kwargs)
 
     cb = [TrainingETACallback(), ValidationCallback(), PeftAdapterSaveCallback(model)]
+    if model_type == "speecht5":
+        cb.append(SpeechT5GuidedAttentionLayerdropCallback(model))
     if _get_peft_model_for_save(model) is not None:
         print("💾 Após cada save: adapter_config + adapter (PEFT) em checkpoint-* (além do state do Trainer).")
     _baw = int(train_params.get("binary_align_warmup_steps", 0) or 0)
