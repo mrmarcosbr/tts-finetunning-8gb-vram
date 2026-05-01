@@ -1,3 +1,12 @@
+.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml 
+
+.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --resume_from ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-30-20-14-15\checkpoint-4900" 
+
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-05-01-00-37-27\checkpoint-9900" --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --compute_f0_rmse --dataset_reference_audios --infer_all_test_sentences
+
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-27-02-20-47\checkpoint-9500" --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --dataset_reference_audios --infer_all_test_sentences --speecht5_zero_speaker_embedding
+
+
 # tts-finetunning-8gb-vram
 
 - Testado com python 3.11.9 (Windows) e 3.12.3 (Linux)

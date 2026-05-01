@@ -27,8 +27,8 @@ hardware_profiles:
   cuda_16gb:
     device: "cuda"
     # Menos acumulação (4 vs 8) = menos micro-passos/optimizer, mesmo lote global ~128
-    batch_size: 32
-    gradient_accumulation_steps: 4
+    batch_size: 16
+    gradient_accumulation_steps: 8
     # RTX 30/40/50+: bf16 em geral sólido; com fp16=false. Dataset pode sobrepor com training.bf16: false
     bf16: true
     fp16: false
