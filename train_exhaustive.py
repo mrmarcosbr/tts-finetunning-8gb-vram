@@ -16,6 +16,7 @@ warnings.filterwarnings(
 )
 
 import importlib
+import inspect
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,8 @@ def safe_load(*args, **kwargs):
 torch.load = safe_load
 
 import json
+import re
+import shutil
 import yaml
 import random
 import torchaudio
@@ -52,10 +55,120 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union, Optional
 from collections import Counter, defaultdict
 
+
+def _patch_hf_hub_use_auth_token_compat() -> None:
+    """SpeechBrain + huggingface_hub: ``use_auth_token`` → ``token``."""
+    try:
+        import huggingface_hub
+
+        _orig = huggingface_hub.hf_hub_download
+
+        def _hf_hub_download_compat(*args, **kwargs):
+            if "use_auth_token" in kwargs and kwargs.get("token") is None:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            else:
+                kwargs.pop("use_auth_token", None)
+            return _orig(*args, **kwargs)
+
+        huggingface_hub.hf_hub_download = _hf_hub_download_compat
+        try:
+            import huggingface_hub.file_download as _fd
+
+            if hasattr(_fd, "hf_hub_download"):
+                _fd.hf_hub_download = _hf_hub_download_compat
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_hf_hub_use_auth_token_compat()
+
 from datasets import load_dataset, Audio, Dataset, load_from_disk
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan, TrainerCallback
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
+from speecht5_mel_utils import waveform_to_speecht5_label_tensor
+
+
+def _training_arguments_kwargs_for_version(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Só passa para ``TrainingArguments`` chaves aceites pela versão instalada do transformers
+    (evita ``TypeError: unexpected keyword argument`` em versões antigas, ex. ``save_safetensors``).
+    """
+    sig = inspect.signature(TrainingArguments.__init__)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(kwargs)
+    allowed = {n for n in sig.parameters if n != "self"}
+    out = {k: v for k, v in kwargs.items() if k in allowed}
+    dropped = sorted(set(kwargs) - set(out))
+    if dropped:
+        print(f"   ℹ️ TrainingArguments: parâmetros não suportados nesta versão do transformers (omitidos): {dropped}")
+    return out
+
+from inference_noise_reduce import (
+    DEFAULT_NR_NOISE_CLIP_SECONDS,
+    DEFAULT_NR_PROP_DECREASE,
+    DEFAULT_NR_PEAK_MATCH,
+)
+
+
+def _patch_speechbrain_fetch_optional_custom_py() -> None:
+    """
+    Repos HF sem ``custom.py``: também rebind ``interfaces.fetch`` / ``classifiers.fetch``
+    (import directo, não só ``fetching.fetch``).
+    """
+    try:
+        import speechbrain.utils.fetching as _sb_fetch
+
+        _orig = _sb_fetch.fetch
+
+        def _fetch(*args, **kwargs):
+            try:
+                return _orig(*args, **kwargs)
+            except Exception as exc:
+                fn = kwargs.get("filename")
+                if fn is None and args:
+                    fn = args[0]
+                if str(fn) != "custom.py":
+                    raise
+                msg = str(exc).lower()
+                tnm = type(exc).__name__.lower()
+                if (
+                    "404" in msg
+                    or "not found" in msg
+                    or "remoteentry" in tnm
+                    or "entrynotfound" in tnm
+                    or "httpstatus" in tnm
+                    or "http error" in msg
+                ):
+                    raise ValueError("optional custom.py not found on Hugging Face Hub") from exc
+                raise
+
+        _sb_fetch.fetch = _fetch
+        try:
+            import speechbrain.inference.interfaces as _sb_if
+
+            _sb_if.fetch = _fetch
+        except Exception:
+            pass
+        try:
+            import speechbrain.inference.classifiers as _sb_cls
+
+            _sb_cls.fetch = _fetch
+        except Exception:
+            pass
+        try:
+            import speechbrain.utils.parameter_transfer as _sb_pt
+
+            _sb_pt.fetch = _fetch
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_speechbrain_fetch_optional_custom_py()
 
 
 def _device_for_speechbrain(device: str) -> str:
@@ -190,11 +303,33 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # --- Funções Utilitárias ---
-def normalize_text(text):
-    if not text: return ""
-    text = text.lower().replace('\n', ' ').strip()
-    return ''.join(c for c in unicodedata.normalize('NFD', text)
-                   if unicodedata.category(c) != 'Mn')
+def normalize_text_legacy_stripped(text: str) -> str:
+    """
+    Normalização herdada do pipeline SpeechT5 / outros modelos HF antes do Gruut NFC.
+    NFD sem categoria Mn (remove til, ç composto como diacrítico, etc.).
+    """
+    if not text:
+        return ""
+    text = text.lower().replace("\n", " ").strip()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+    )
+
+
+def normalize_text_fastpitch_locale(text: str, language: Optional[str] = None) -> str:
+    """
+    Só perfil FastSpeech2 (Coqui/Gruut): PT com NFC preserva ç, ã, acentos; EN remove diacríticos.
+    """
+    if not text:
+        return ""
+    text = text.lower().replace("\n", " ").strip()
+    lang_base = (language if language is not None else "pt").lower().split("-")[0]
+    if lang_base in ("en",):
+        return "".join(
+            c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+        )
+    return unicodedata.normalize("NFC", text)
+
 
 def extract_speaker_id(item):
     for k in ['speaker_id', 'speaker', 'user_id', 'client_id']:
@@ -358,6 +493,7 @@ def merge_speecht5_train_dataset_multi_sentence(
     multi_sample_fraction: float = 1.0,
     mix_mode: str = "replace",
     append_multi_ratio: float = 1.0,
+    log_label: str = "SpeechT5",
 ) -> Dataset:
     """
     Agrupa amostras multi-frase (mesmo locutor), texto com '. ' e áudio com gap.
@@ -403,7 +539,7 @@ def merge_speecht5_train_dataset_multi_sentence(
         singles = [_speecht5_train_row_as_single_record(train_dataset[i], target_sr) for i in range(n)]
         if k <= 0:
             print(
-                f"   🔀 SpeechT5 append multi: ratio={ar:g} ⇒ 0 extras; dataset inalterado ({n} amostras)."
+                f"   🔀 {log_label} append multi: ratio={ar:g} ⇒ 0 extras; dataset inalterado ({n} amostras)."
             )
             return train_dataset
         multi_rows = [
@@ -427,7 +563,7 @@ def merge_speecht5_train_dataset_multi_sentence(
         else:
             random.shuffle(new_rows)
         print(
-            f"   🔀 SpeechT5 multi-frase APPEND: {n} single + {k} multi → {len(new_rows)} amostras | "
+            f"   🔀 {log_label} multi-frase APPEND: {n} single + {k} multi → {len(new_rows)} amostras | "
             f"K={pool_size} modo={mode} | gap={gap_sec}s | append_multi_ratio={ar:g} (k=round(n×ratio))."
         )
         out = Dataset.from_list(new_rows)
@@ -473,18 +609,293 @@ def merge_speecht5_train_dataset_multi_sentence(
         else ""
     )
     print(
-        f"   🔀 SpeechT5 multi-frase REPLACE: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
+        f"   🔀 {log_label} multi-frase REPLACE: {n} → {len(out)} amostras | K={pool_size} modo={mode} | "
         f"gap={gap_sec}s entre clipes{mix_note} | texto multi ligado com '. '."
     )
     return out.cast_column("audio", Audio(sampling_rate=int(target_sr)))
 
 
-def load_config(config_path="config.yaml"):
+def load_config(config_path="config_train.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
-# Sufixo de pasta de cache: incrementar se mudar F0 / mel em prepare_item (FastPitch)
-FS2_F0_DATASET_VERSION = "f0zscore_v1"
+# Sufixo de pasta de cache: incrementar se mudar F0 / mel / normalização de texto em prepare_item (FastPitch)
+FS2_F0_DATASET_VERSION = "f0zscore_v2_nfcpt"
+# Incrementar quando os labels SpeechT5 (log-mel) deixarem de ser compatíveis com caches antigos
+SPEECHT5_MEL_LABELS_CACHE_VERSION = "hf_fe_v1"
+# Sufixo final no diretório cache_processado (SpeechT5): evita sobrescrever caches de labels antes do alinhamento HF/log10
+SPEECHT5_CACHE_DIR_SUFFIX_LOG10 = "log10"
+# Sufixo quando --noise_reduce: NR + peak_match + prop_decrease project default (evita caches incompatíveis)
+SPEECHT5_NR_GATE_CACHE_TAG = "gate_st6"
+
+
+def apply_noise_reduce_to_dataset_audio(
+    dataset: Dataset,
+    *,
+    target_sr: int,
+    noise_clip_seconds: float = DEFAULT_NR_NOISE_CLIP_SECONDS,
+    stationary: bool = True,
+    smart_stationary: bool = False,
+    prop_decrease: float = DEFAULT_NR_PROP_DECREASE,
+    peak_match: bool = DEFAULT_NR_PEAK_MATCH,
+    desc: str = "noise_reduce_audio",
+) -> Dataset:
+    """
+    Aplica ``noise_reduce_waveform`` (mesmo chamamento que ``noise_remove_test.py`` quando não se usa
+    ``--noise_reduce_smart_stationary`` / ``--noise_reduce_nonstationary``) a cada exemplo.
+
+    Com coluna ``Audio`` do Hugging Face, se a saída do ``map`` ainda contiver ``path`` para o
+    WAV original, o indexador pode voltar a ler o ficheiro em disco (sem NR). Por isso a saída
+    usa só ``array`` + ``sampling_rate``.
+
+    Com ``stationary=True`` (predefinição), os primeiros ``noise_clip_seconds`` s formam o
+    perfil de ruído (``y_noise``). Com ``False``, o ``noise_clip_seconds`` não altera o
+    algoritmo noisereduce 3.x (ver doc em ``inference_noise_reduce``).
+
+    Com ``smart_stationary=True`` (opcional, ``--noise_reduce_smart_stationary``) e
+    ``stationary=True``, por clip chama-se ``auto_pick_stationary_for_clip`` — **não** é o mesmo
+    que ``noise_remove_test.py``, que usa sempre ``stationary=True``.
+
+    ``peak_match`` (predef. True): repõe o pico do sinal como na entrada, mitigando queda de volume.
+    """
+    from inference_noise_reduce import auto_pick_stationary_for_clip, noise_reduce_waveform
+
+    nr_stat_counts: list[int] = [0, 0]  # [stationary rows, nonstationary rows]
+
+    def _nr_row(example: Dict[str, Any]) -> Dict[str, Any]:
+        au = example.get("audio")
+        if au is None:
+            return example
+        if not isinstance(au, dict):
+            return example
+
+        sr = int(target_sr)
+        y: np.ndarray
+        if au.get("array") is not None:
+            y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
+            sr = int(au.get("sampling_rate", target_sr) or target_sr)
+        else:
+            p = au.get("path")
+            if isinstance(p, str) and os.path.isfile(p):
+                _y, _sr = librosa.load(p, sr=int(target_sr), mono=True)
+                y = np.asarray(_y, dtype=np.float32).reshape(-1)
+                sr = int(_sr)
+            else:
+                return example
+
+        if not stationary:
+            eff_stationary = False
+        elif smart_stationary:
+            eff_stationary = bool(
+                auto_pick_stationary_for_clip(y, sr, float(noise_clip_seconds))
+            )
+        else:
+            eff_stationary = True
+        nr_stat_counts[1 if not eff_stationary else 0] += 1
+
+        y2 = noise_reduce_waveform(
+            y,
+            sr,
+            noise_clip_seconds=float(noise_clip_seconds),
+            stationary=eff_stationary,
+            prop_decrease=float(prop_decrease),
+            peak_match=bool(peak_match),
+        )
+        # Não incluir ``path``/``bytes`` na saída: com coluna HF ``Audio``, reter ``path``
+        # faz o ``__getitem__`` voltar a ler o WAV em disco (sinal original, sem NR).
+        y2f = np.asarray(y2, dtype=np.float32).reshape(-1)
+        out = {k: v for k, v in example.items() if k != "audio"}
+        out["audio"] = {
+            "array": y2f,
+            "sampling_rate": int(sr),
+        }
+        return out
+
+    mapped = dataset.map(
+        _nr_row,
+        desc=desc,
+        load_from_cache_file=False,
+    )
+    if smart_stationary and stationary:
+        n_st = nr_stat_counts[0]
+        n_nst = nr_stat_counts[1]
+        tot = n_st + n_nst
+        if tot > 0:
+            print(
+                f"   🧠 NR smart: {n_st} clip(s) estacionário (y_noise no início) | "
+                f"{n_nst} clip(s) não estacionário (início parecido com fala/sem perfil de só ruído)"
+            )
+    return mapped.cast_column("audio", Audio(sampling_rate=int(target_sr)))
+
+
+def save_noise_reduce_preview_wavs(
+    dataset: Dataset,
+    out_dir: str,
+    *,
+    target_sr: int,
+    n_samples: int = 5,
+) -> int:
+    """
+    Grava até ``n_samples`` WAVs com **locutores distintos** (primeira ocorrência de cada ID),
+    a partir do dataset já processado com NR — para conferência em ``.../nr_preview/``.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    seen_spk: set[str] = set()
+    written = 0
+    for i in range(len(dataset)):
+        if written >= n_samples:
+            break
+        row = dataset[i]
+        spk = extract_speaker_id(row)
+        if spk in seen_spk:
+            continue
+        seen_spk.add(spk)
+        au = row.get("audio")
+        if not isinstance(au, dict) or "array" not in au:
+            continue
+        y = np.asarray(au["array"], dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            continue
+        sr = int(au.get("sampling_rate", target_sr) or target_sr)
+        token = re.sub(r"[^\w.\-+]+", "_", str(spk)).strip("_")[:48] or "spk"
+        path = os.path.join(out_dir, f"nr_preview_{written + 1:02d}_{token}_idx{i}.wav")
+        sf.write(path, y, sr, subtype="PCM_16")
+        written += 1
+    return written
+
+
+NR_PROCESSED_CACHE_MANIFEST = "nr_processed_cache_manifest.json"
+
+
+def nr_cache_manifest_expected(args: Any) -> Dict[str, Any]:
+    """Assinatura dos parâmetros NR usados em treino; deve coincidir com o manifest em cache_processado."""
+    if not getattr(args, "noise_reduce", False):
+        return {"noise_reduce": False, "manifest_version": 1}
+    _nc = float(getattr(args, "noise_clip_sec", DEFAULT_NR_NOISE_CLIP_SECONDS) or DEFAULT_NR_NOISE_CLIP_SECONDS)
+    _nr_stat = not bool(getattr(args, "noise_reduce_nonstationary", False))
+    _nr_smart = bool(_nr_stat) and bool(getattr(args, "noise_reduce_smart_stationary", False))
+    _nr_pd = float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE))
+    _nr_pk = not bool(getattr(args, "no_noise_peak_match", False))
+    return {
+        "manifest_version": 1,
+        "noise_reduce": True,
+        "nr_gate_tag": SPEECHT5_NR_GATE_CACHE_TAG,
+        "noise_clip_seconds": _nc,
+        "noise_prop_decrease": _nr_pd,
+        "noise_peak_match": _nr_pk,
+        "noise_reduce_stationary": bool(_nr_stat),
+        "noise_reduce_smart_stationary": bool(_nr_smart),
+    }
+
+
+def _rmtree_disk_cache_dir(path: str, label: str) -> None:
+    if path and os.path.isdir(path):
+        try:
+            shutil.rmtree(path)
+            print(f"   🗑️  Cache em disco removido: {label} → {path}")
+        except OSError as exc:
+            print(f"   ⚠️ Não foi possível remover {label} ({path}): {exc}")
+
+
+def invalidate_nr_processed_disk_caches_if_manifest_mismatch(cache_base_dir: str, args: Any) -> None:
+    """
+    Garante que pastas ``train``/``val``/``test`` em ``cache_base_dir`` só são reutilizadas se o
+    manifest JSON tiver **exactamente** os mesmos parâmetros NR que os args actuais (clip,
+    prop_decrease, peak_match, estacionário, tag). Caso contrário, apaga essas pastas para forçar
+    ``prepare_item`` a partir dos datasets já tratados com NR na RAM.
+    """
+    if not getattr(args, "noise_reduce", False):
+        return
+    expected = nr_cache_manifest_expected(args)
+    manifest_path = os.path.join(cache_base_dir, NR_PROCESSED_CACHE_MANIFEST)
+    if not os.path.isfile(manifest_path):
+        print(
+            "⚠️ NR: manifest de cache processado ausente (nr_processed_cache_manifest.json). "
+            "A invalidar train/val/test em disco para reconstruir a partir do áudio com NR."
+        )
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "train"), "train")
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "val"), "val")
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "test"), "test")
+        return
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠️ NR: manifest ilegível ({exc}). A invalidar caches processados.")
+        loaded = None
+    if loaded != expected:
+        print(
+            "⚠️ NR: parâmetros ou tag de NR não coincidem com o manifest gravado; "
+            "a invalidar caches processados para não treinar com mels antigos."
+        )
+        if loaded is not None:
+            print(f"   Manifest antigo: {loaded}")
+        print(f"   Esperado agora: {expected}")
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "train"), "train")
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "val"), "val")
+        _rmtree_disk_cache_dir(os.path.join(cache_base_dir, "test"), "test")
+
+
+def write_nr_processed_cache_manifest(cache_base_dir: str, args: Any) -> None:
+    """Grava manifest após garantir caches; com --noise_reduce regista parâmetros NR para a próxima corrida."""
+    if not getattr(args, "noise_reduce", False):
+        return
+    os.makedirs(cache_base_dir, exist_ok=True)
+    path = os.path.join(cache_base_dir, NR_PROCESSED_CACHE_MANIFEST)
+    payload = nr_cache_manifest_expected(args)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print(f"💾 Manifest NR (cache processado): {os.path.abspath(path)}")
+
+
+def verify_hf_audio_splits_materialized_no_audio_path(
+    *,
+    train_ds: Dataset,
+    val_ds: Optional[Dataset],
+    test_ds: Optional[Dataset],
+    per_split_checks: int = 32,
+    seed: int = 42,
+) -> None:
+    """
+    Confirma que os splits usados no treino expõem ``audio`` como ``array`` em memória e **não**
+    como ``path`` para o ficheiro original (o que faria o Hugging Face ignorar o NR aplicado no map).
+    """
+    rng = random.Random(int(seed))
+
+    def _check_one(split: str, ds: Dataset, n_req: int) -> None:
+        n = len(ds)
+        if n <= 0:
+            return
+        k = min(int(n_req), n)
+        idxs = list(range(n)) if k >= n else rng.sample(range(n), k)
+        for i in idxs:
+            row = ds[i]
+            au = row.get("audio")
+            if not isinstance(au, dict):
+                raise RuntimeError(f"NR verificação: {split}[{i}] sem dict 'audio'.")
+            p = au.get("path")
+            if isinstance(p, str) and p.strip() != "":
+                raise RuntimeError(
+                    f"NR verificação: {split}[{i}] ainda tem audio.path={p!r} — o treino poderia ler o WAV "
+                    "original sem NR. Corrija o pipeline (map NR deve gravar só array+sampling_rate)."
+                )
+            arr = au.get("array")
+            if arr is None:
+                raise RuntimeError(f"NR verificação: {split}[{i}] sem audio.array.")
+            y = np.asarray(arr, dtype=np.float32).reshape(-1)
+            if y.size <= 0 or not np.isfinite(y).all():
+                raise RuntimeError(f"NR verificação: {split}[{i}] audio.array inválido ou vazio.")
+
+    _check_one("train", train_ds, per_split_checks)
+    if val_ds is not None:
+        _check_one("val", val_ds, per_split_checks)
+    if test_ds is not None:
+        _check_one("test", test_ds, per_split_checks)
+    print(
+        f"✅ NR: amostras verificadas (até {per_split_checks}/split) — áudio só em array, sem path para ficheiro original."
+    )
+
 
 def detect_hardware_profile(full_cfg):
     """Tenta identificar o melhor perfil de hardware automaticamente."""
@@ -677,17 +1088,16 @@ class SpeechT5Handler(ModelHandler):
     def prepare_item(self, batch, processor, speaker_model, language=None):
         audio = batch["audio"]
         override = batch.pop("speaker_embedding_override", None)
-        clean_text = normalize_text(batch.get("text", "dummy"))
+        clean_text = normalize_text_legacy_stripped(batch.get("text", "dummy"))
         batch["input_ids"] = processor(text=clean_text, return_tensors="pt").input_ids[0]
-        y = np.array(audio["array"])
+        y = np.asarray(audio["array"], dtype=np.float32).reshape(-1)
         mel_sr = int(self.model_cfg.get("sampling_rate", 16000))
-        
-        # SpeechT5 espera mel-spectrogram como labels (alinhado a target_sr do cast_column)
-        mel = librosa.feature.melspectrogram(
-            y=y, sr=mel_sr, n_fft=1024, hop_length=256, n_mels=80, fmin=80, fmax=7600
-        )
-        log_mel = np.log10(np.clip(mel, 1e-5, None)).T
-        batch["labels"] = torch.tensor(log_mel)
+        fe = processor.feature_extractor
+        if int(mel_sr) != int(getattr(fe, "sampling_rate", mel_sr)):
+            raise ValueError(
+                f"sampling_rate do modelo ({mel_sr}) != feature_extractor.sampling_rate ({fe.sampling_rate})"
+            )
+        batch["labels"] = waveform_to_speecht5_label_tensor(y, fe, mel_sr)
 
         used_override = False
         if override is not None and speaker_model is not None:
@@ -894,7 +1304,7 @@ class XTTSHandler(ModelHandler):
         audio = batch["audio"]
         y = np.array(audio["array"])
         sr = audio.get("sampling_rate", 24000)
-        text = normalize_text(batch.get("text", ""))
+        text = normalize_text_legacy_stripped(batch.get("text", ""))
         
         # O XTTS v2 oficial da Coqui requer caminhos de arquivos para extrair condicionamento
         # Usamos arquivos temporários para compatibilidade total com a API
@@ -1227,19 +1637,36 @@ class FastSpeech2Handler(ModelHandler):
     def compute_f0_zscore_from_train_dataset(self, train_dataset, max_samples: Optional[int] = None) -> None:
         """Uma passagem pelo treino: concatena f0>0 (Hz) e define mean/std (Coqui-style)."""
         import librosa
+
+        try:
+            from tqdm.auto import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None  # type: ignore[misc, assignment]
+
         vals: List[np.ndarray] = []
         n = len(train_dataset) if max_samples is None else min(len(train_dataset), max_samples)
-        for i in range(n):
-            item = train_dataset[i]
-            y = np.array(item["audio"]["array"], dtype=np.float32)
-            sr = item["audio"].get("sampling_rate", self.ap.sample_rate)
-            if int(sr) != int(self.ap.sample_rate):
-                y = librosa.resample(y, orig_sr=int(sr), target_sr=int(self.ap.sample_rate))
-            f0 = self.ap.compute_f0(y)
-            f0 = np.nan_to_num(f0)
-            nz = f0[f0 > 0.0]
-            if nz.size:
-                vals.append(nz)
+        print(
+            f"📈 F0 z-score (corpus): pyin em até {n} clipes de treino — costuma ser lento em CPU "
+            f"(minutos). Para acelerar: no YAML do perfil, `f0_stats_max_train_samples: 120` (ou similar).",
+            flush=True,
+        )
+        indices = range(n)
+        if _tqdm is not None:
+            indices = _tqdm(indices, desc="F0 stats (Hz)", unit="clip")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            for i in indices:
+                item = train_dataset[i]
+                y = np.array(item["audio"]["array"], dtype=np.float32)
+                sr = item["audio"].get("sampling_rate", self.ap.sample_rate)
+                if int(sr) != int(self.ap.sample_rate):
+                    y = librosa.resample(y, orig_sr=int(sr), target_sr=int(self.ap.sample_rate))
+                f0 = self.ap.compute_f0(y)
+                f0 = np.nan_to_num(f0)
+                nz = f0[f0 > 0.0]
+                if nz.size:
+                    vals.append(nz)
         if not vals:
             self.set_f0_zscore_stats(150.0, 40.0)
             print("⚠️ F0: sem amostras não nulas; usando mean=150, std=40 (fallback).")
@@ -1248,11 +1675,14 @@ class FastSpeech2Handler(ModelHandler):
         self.set_f0_zscore_stats(float(np.mean(cat)), float(np.std(cat)))
         print(f"📈 F0 z-score: mean={self.f0_norm_mean:.2f} Hz, std={self.f0_norm_std:.2f} Hz (n={len(cat)} frame values)")
 
-    def prepare_item(self, batch, processor, speaker_model, language="en"):
+    def _coqui_normalize_input_text(self, text: str, language: str) -> str:
+        return normalize_text_fastpitch_locale(text or "", language)
+
+    def prepare_item(self, batch, processor, speaker_model, language="pt"):
         audio = batch["audio"]
         y = np.array(audio["array"])
         sr = audio.get("sampling_rate", 22050)
-        text = normalize_text(batch.get("text", ""))
+        text = self._coqui_normalize_input_text(batch.get("text", "") or "", language)
         
         # Tokenização (FS2 usa fonemas internamente via tokenizer)
         input_ids = processor.text_to_ids(text, language=language)
@@ -1340,7 +1770,7 @@ class MatchaHandler(ModelHandler):
         audio = batch["audio"]
         y = np.array(audio["array"])
         sr = audio.get("sampling_rate", 22050)
-        text = normalize_text(batch.get("text", ""))
+        text = normalize_text_legacy_stripped(batch.get("text", ""))
         
         # Matcha usa phonemizer externo
         from matcha.utils.cleaners import english_cleaners
@@ -1399,6 +1829,10 @@ class GlowTTSHandler(FastSpeech2Handler):
         self.model_glow.to(self.device)
         self.model = FastSpeech2Wrapper(self.model_glow, self.device) # Reutiliza wrapper de loss
         return self.model, self.model_glow.tokenizer
+
+    def _coqui_normalize_input_text(self, text: str, language: str) -> str:
+        return normalize_text_legacy_stripped(text or "")
+
 
 class GenericSOTAHandler(ModelHandler):
     def load(self, resume_from=None, resume_model_only=False):
@@ -1538,7 +1972,7 @@ def main():
     parser = argparse.ArgumentParser(description="Treinamento TTS Generalizado con LoRA")
     parser.add_argument("--profile", type=str, default=None, help="Perfil de hardware (opcional)")
     parser.add_argument("--dataset", type=str, default=None, help="Perfil do dataset configurado no YAML")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Caminho do arquivo config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml", help="Caminho do arquivo config_train.yaml")
     parser.add_argument("--resume_from", type=str, default=None, help="Caminho para checkpoint ou modelo para continuar treinamento")
     parser.add_argument(
         "--resume_model_only",
@@ -1546,7 +1980,65 @@ def main():
         help="Com --resume_from: carrega só os pesos no modelo (ex.: após mudar target_modules LoRA); "
         "NÃO reutiliza optimizer/scheduler/global_step do checkpoint (evita incompat. de parâmetros).",
     )
+    parser.add_argument(
+        "--noise_reduce",
+        action="store_true",
+        help=(
+            "Aplica noisereduce a todo o áudio dos splits de treino, validação e teste "
+            "(antes do cache em cache_processado). O split de teste com NR é gravado em …/cache_processado/…/test. "
+            "A pasta de cache inclui o sufixo _nr."
+        ),
+    )
+    parser.add_argument(
+        "--noise_clip_sec",
+        type=float,
+        default=DEFAULT_NR_NOISE_CLIP_SECONDS,
+        metavar="SEC",
+        help="Segundos iniciais de cada clip como estimativa de ruído (com --noise_reduce).",
+    )
+    parser.add_argument(
+        "--noise_prop_decrease",
+        type=float,
+        default=DEFAULT_NR_PROP_DECREASE,
+        metavar="P",
+        help="Prop. decrease noisereduce [0,1] (igual inference_noise_remove / inferência).",
+    )
+    parser.add_argument(
+        "--no_noise_peak_match",
+        action="store_true",
+        help="Com --noise_reduce: não igualar o pico do sinal ao da entrada após o NR.",
+    )
+    parser.add_argument(
+        "--noise_reduce_nonstationary",
+        action="store_true",
+        help=(
+            "Com --noise_reduce: força gating não estacionário em **todos** os clipes. "
+            "Omisso: igual a ``noise_remove_test.py`` — ``noise_reduce_waveform(..., stationary=True)`` "
+            "por clip (exceto se ``--noise_reduce_smart_stationary``)."
+        ),
+    )
+    parser.add_argument(
+        "--noise_reduce_smart_stationary",
+        action="store_true",
+        help=(
+            "Com --noise_reduce e **sem** --noise_reduce_nonstationary: por clip, escolhe estacionário "
+            "vs não conforme ``auto_pick_stationary_for_clip`` (diferente do ``noise_remove_test.py``, "
+            "que usa sempre stationary=True)."
+        ),
+    )
     args = parser.parse_args()
+
+    if getattr(args, "noise_reduce", False):
+        try:
+            import noisereduce  # noqa: F401
+        except ModuleNotFoundError:
+            print(
+                "❌ --noise_reduce exige o pacote ``noisereduce`` neste intérprete Python.\n"
+                "   Instale com:  python -m pip install noisereduce==3.0.3\n"
+                "   Use o mesmo venv com que corres o script (com ``run_with_log.ps1`` activa o venv; "
+                "o script usa ``VIRTUAL_ENV`` se existir)."
+            )
+            sys.exit(1)
 
     full_cfg = load_config(args.config)
     
@@ -1734,11 +2226,75 @@ def main():
         
     train_params = ds_cfg.get("training") or {}
 
+    train_ds_after_nr_before_merge: Optional[Dataset] = None
+
     # Configurar Sampling Rate
     target_sr = model_cfg.get('sampling_rate', 16000)
     train_dataset = train_dataset.cast_column("audio", Audio(sampling_rate=target_sr))
     if val_dataset:
         val_dataset = val_dataset.cast_column("audio", Audio(sampling_rate=target_sr))
+    if test_dataset:
+        test_dataset = test_dataset.cast_column("audio", Audio(sampling_rate=target_sr))
+
+    if getattr(args, "noise_reduce", False):
+        _nc = float(getattr(args, "noise_clip_sec", DEFAULT_NR_NOISE_CLIP_SECONDS) or DEFAULT_NR_NOISE_CLIP_SECONDS)
+        _nr_stat = not bool(getattr(args, "noise_reduce_nonstationary", False))
+        _nr_smart = bool(_nr_stat) and bool(getattr(args, "noise_reduce_smart_stationary", False))
+        _nr_pd = float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE))
+        _nr_pk = not bool(getattr(args, "no_noise_peak_match", False))
+        _nr_mode = (
+            "estacionário — primeiros segundos = perfil y_noise (recomendado se houver silêncio/ruído no início)"
+            if _nr_stat
+            else "não estacionário — perfil y_noise ignorado pela biblioteca (só gating ao longo do sinal)"
+        )
+        _smart_note = ""
+        if _nr_smart:
+            _smart_note = " | smart por clip (≠ noise_remove_test.py)"
+        print(
+            f"🧹 Remoção de ruído em treino, validação e teste "
+            f"(noise_clip={_nc}s, prop_decrease={_nr_pd}, peak_match={_nr_pk}) | {_nr_mode}{_smart_note}"
+        )
+        train_dataset = apply_noise_reduce_to_dataset_audio(
+            train_dataset,
+            target_sr=target_sr,
+            noise_clip_seconds=_nc,
+            stationary=_nr_stat,
+            smart_stationary=_nr_smart,
+            prop_decrease=_nr_pd,
+            peak_match=_nr_pk,
+            desc="noise_reduce_train",
+        )
+        train_ds_after_nr_before_merge = train_dataset
+        if val_dataset:
+            val_dataset = apply_noise_reduce_to_dataset_audio(
+                val_dataset,
+                target_sr=target_sr,
+                noise_clip_seconds=_nc,
+                stationary=_nr_stat,
+                smart_stationary=_nr_smart,
+                prop_decrease=_nr_pd,
+                peak_match=_nr_pk,
+                desc="noise_reduce_val",
+            )
+        if test_dataset:
+            test_dataset = apply_noise_reduce_to_dataset_audio(
+                test_dataset,
+                target_sr=target_sr,
+                noise_clip_seconds=_nc,
+                stationary=_nr_stat,
+                smart_stationary=_nr_smart,
+                prop_decrease=_nr_pd,
+                peak_match=_nr_pk,
+                desc="noise_reduce_test",
+            )
+        split_info["noise_reduce"] = True
+        split_info["noise_clip_seconds"] = _nc
+        split_info["noise_reduce_stationary"] = bool(_nr_stat)
+        split_info["noise_reduce_smart_stationary"] = bool(_nr_smart)
+        split_info["noise_prop_decrease"] = _nr_pd
+        split_info["noise_peak_match"] = bool(_nr_pk)
+        with open(os.path.join(out_dir, "dataset_split.json"), "w", encoding="utf-8") as f:
+            json.dump(split_info, f, indent=4)
 
     # 6. Speaker Encoder & Processing
     print(f"🔊 Processando áudio em {target_sr} Hz...")
@@ -1751,6 +2307,22 @@ def main():
         )
     
     language = ds_cfg.get("language", "pt")
+    _lang0 = (language or "pt").lower().split("-")[0]
+    if model_type == "fastspeech2":
+        print(
+            "📝 Normalização de texto (FastSpeech2/Gruut): "
+            + (
+                "minúsculas + NFC (acentos e ç preservados)"
+                if _lang0 not in ("en",)
+                else "minúsculas + remoção de diacríticos (EN)"
+            )
+            + f" | dataset language={language!r}",
+        )
+    else:
+        print(
+            f"📝 Normalização de texto (pipeline actual): legacy NFD→strip Mn (SpeechT5 / outros mantêm comportamento anterior) "
+            f"| dataset language={language!r}",
+        )
 
     _pool_sz = 1
     _pool_md = "concat"
@@ -1759,35 +2331,48 @@ def main():
     _pool_multi_frac = 1.0
     _pool_mix_mode = "replace"
     _pool_append_ratio = 1.0
+    _pool_cfg_key: Optional[str] = None
+    _pool_log_tag = "SpeechT5"
     if model_type == "speecht5":
-        _pool_sz = int(train_params.get("speecht5_train_spk_pool_size", 1) or 1)
-        _pool_md = str(train_params.get("speecht5_train_spk_pool_mode", "concat")).strip().lower()
-        _pool_gap = float(train_params.get("speecht5_train_spk_pool_gap_sec", 0.25))
-        _pool_sd = train_params.get("speecht5_train_spk_pool_seed", None)
-        _pool_multi_frac = max(0.0, min(1.0, float(train_params.get("speecht5_train_spk_pool_multi_fraction", 1.0))))
-        _pool_mix_mode = str(train_params.get("speecht5_train_spk_pool_mix_mode", "replace")).strip().lower()
-        _pool_append_ratio = max(0.0, float(train_params.get("speecht5_train_spk_pool_append_multi_ratio", 1.0)))
+        _pool_cfg_key = "speecht5_train_spk_pool"
+        _pool_log_tag = "SpeechT5"
+    elif model_type in ("fastspeech2", "glow_tts"):
+        _pool_cfg_key = "fastspeech2_train_spk_pool"
+        _pool_log_tag = "FastSpeech2" if model_type == "fastspeech2" else "Glow-TTS"
+
+    if _pool_cfg_key is not None:
+        pk = _pool_cfg_key
+        _pool_sz = int(train_params.get(f"{pk}_size", 1) or 1)
+        _pool_md = str(train_params.get(f"{pk}_mode", "concat")).strip().lower()
+        _pool_gap = float(train_params.get(f"{pk}_gap_sec", 0.25))
+        _pool_sd = train_params.get(f"{pk}_seed", None)
+        _pool_multi_frac = max(0.0, min(1.0, float(train_params.get(f"{pk}_multi_fraction", 1.0))))
+        _pool_mix_mode = str(train_params.get(f"{pk}_mix_mode", "replace")).strip().lower()
+        _pool_append_ratio = max(0.0, float(train_params.get(f"{pk}_append_multi_ratio", 1.0)))
         if _pool_sz > 1:
             if _pool_md not in ("mean", "concat"):
-                print(f"❌ speecht5_train_spk_pool_mode inválido: {_pool_md!r} (use mean ou concat).")
+                print(f"❌ {pk}_mode inválido: {_pool_md!r} (use mean ou concat).")
+                sys.exit(1)
+            if model_type in ("fastspeech2", "glow_tts") and _pool_md == "mean":
+                print(
+                    f"❌ {pk}_mode=mean não se aplica ao {model_type}: o treino não usa x-vector por clipe. "
+                    f"Use {pk}_mode: concat."
+                )
                 sys.exit(1)
             if _pool_md == "mean" and speaker_model is None:
-                print("❌ speecht5_train_spk_pool_mode=mean requer speaker_encoder_id em models.speecht5.")
+                print(f"❌ {pk}_mode=mean requer speaker_encoder_id em models.{model_type}.")
                 sys.exit(1)
             if _pool_mix_mode not in ("replace", "append"):
-                print(
-                    f"❌ speecht5_train_spk_pool_mix_mode inválido: {_pool_mix_mode!r} "
-                    f"(use 'replace' ou 'append')."
-                )
+                print(f"❌ {pk}_mix_mode inválido: {_pool_mix_mode!r} (use 'replace' ou 'append').")
                 sys.exit(1)
 
             if _pool_mix_mode == "append":
                 if _pool_append_ratio <= 0.0:
                     print(
-                        f"   📎 speecht5_train_spk_pool_append_multi_ratio=0: sem linhas multi extra; "
+                        f"   📎 {pk}_append_multi_ratio=0: sem linhas multi extra; "
                         f"treino com dataset original ({len(train_dataset)} amostras), apesar de K={_pool_sz}."
                     )
-                    split_info["speecht5_train_spk_pool"] = {
+                    split_info[_pool_cfg_key] = {
                         "pool_size": _pool_sz,
                         "mode": _pool_md,
                         "gap_sec": _pool_gap,
@@ -1800,8 +2385,8 @@ def main():
                         json.dump(split_info, f, indent=4)
                 else:
                     print(
-                        f"   📎 Multi-frase APPEND: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s (seed={_pool_sd!r}), "
-                        f"append_multi_ratio={_pool_append_ratio:g} ⇒ +round(n×ratio) linhas multi — só train; "
+                        f"   📎 Multi-frase APPEND ({_pool_log_tag}): K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
+                        f"(seed={_pool_sd!r}), append_multi_ratio={_pool_append_ratio:g} ⇒ +round(n×ratio) linhas multi — só train; "
                         "val permanece sentença-a-sentença."
                     )
                     train_dataset = merge_speecht5_train_dataset_multi_sentence(
@@ -1815,9 +2400,10 @@ def main():
                         multi_sample_fraction=_pool_multi_frac,
                         mix_mode="append",
                         append_multi_ratio=_pool_append_ratio,
+                        log_label=_pool_log_tag,
                     )
                     split_info["counts"]["train_samples"] = len(train_dataset)
-                    split_info["speecht5_train_spk_pool"] = {
+                    split_info[_pool_cfg_key] = {
                         "pool_size": _pool_sz,
                         "mode": _pool_md,
                         "gap_sec": _pool_gap,
@@ -1830,10 +2416,10 @@ def main():
                         json.dump(split_info, f, indent=4)
             elif _pool_multi_frac <= 0.0:
                 print(
-                    f"   📎 Multi-frase desactivada (speecht5_train_spk_pool_multi_fraction=0): "
+                    f"   📎 Multi-frase desactivada ({pk}_multi_fraction=0): "
                     f"treino 100% single apesar de K={_pool_sz} na config."
                 )
-                split_info["speecht5_train_spk_pool"] = {
+                split_info[_pool_cfg_key] = {
                     "pool_size": _pool_sz,
                     "mode": _pool_md,
                     "gap_sec": _pool_gap,
@@ -1846,7 +2432,7 @@ def main():
                     json.dump(split_info, f, indent=4)
             else:
                 print(
-                    f"   📎 Multi-frase REPLACE: K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
+                    f"   📎 Multi-frase REPLACE ({_pool_log_tag}): K={_pool_sz}, modo={_pool_md}, gap={_pool_gap}s "
                     f"(seed={_pool_sd!r}), multi_fraction={_pool_multi_frac:.1%} (Bernoulli por linha) — só train; "
                     "val permanece sentença-a-sentença."
                 )
@@ -1861,9 +2447,10 @@ def main():
                     multi_sample_fraction=_pool_multi_frac,
                     mix_mode="replace",
                     append_multi_ratio=1.0,
+                    log_label=_pool_log_tag,
                 )
                 split_info["counts"]["train_samples"] = len(train_dataset)
-                split_info["speecht5_train_spk_pool"] = {
+                split_info[_pool_cfg_key] = {
                     "pool_size": _pool_sz,
                     "mode": _pool_md,
                     "gap_sec": _pool_gap,
@@ -1876,9 +2463,19 @@ def main():
                     json.dump(split_info, f, indent=4)
     
     # Sistema de Cache Hard (Disco) — sufixo fs2 força recache ao mudar F0 (f0zscore_v1, etc.)
-    _fs2_cache_suffix = f"_{FS2_F0_DATASET_VERSION}" if model_type == "fastspeech2" else ""
+    _nr_cache_tag = "_nr" if getattr(args, "noise_reduce", False) else ""
+    _nr_gate_cache = f"_{SPEECHT5_NR_GATE_CACHE_TAG}" if getattr(args, "noise_reduce", False) else ""
+    _fs2_cache_suffix = (
+        f"_{FS2_F0_DATASET_VERSION}"
+        if model_type in ("fastspeech2", "glow_tts")
+        else ""
+    )
+    _speecht5_mel_cache = f"_{SPEECHT5_MEL_LABELS_CACHE_VERSION}" if model_type == "speecht5" else ""
+    _speecht5_cache_log10 = (
+        f"_{SPEECHT5_CACHE_DIR_SUFFIX_LOG10}" if model_type == "speecht5" else ""
+    )
     _spk_pool_cache = ""
-    if model_type == "speecht5" and _pool_sz > 1:
+    if model_type in ("speecht5", "fastspeech2", "glow_tts") and _pool_sz > 1:
         _use_spk_pool_cache = (_pool_mix_mode == "append" and _pool_append_ratio > 0) or (
             _pool_mix_mode == "replace" and _pool_multi_frac > 0
         )
@@ -1891,12 +2488,34 @@ def main():
     cache_base_dir = os.path.join(
         full_cfg.get('settings', {}).get('local_datasets_dir', './datasets'),
         "cache_processado",
-        f"{model_type}_{dataset_name}_{target_sr}hz{_fs2_cache_suffix}{_spk_pool_cache}",
+        f"{model_type}_{dataset_name}_{target_sr}hz{_nr_cache_tag}{_nr_gate_cache}{_fs2_cache_suffix}{_speecht5_mel_cache}{_spk_pool_cache}{_speecht5_cache_log10}",
     )
     train_cache_path = os.path.join(cache_base_dir, "train")
     val_cache_path = os.path.join(cache_base_dir, "val")
+    test_cache_path = os.path.join(cache_base_dir, "test")
 
-    if model_type == "fastspeech2" and isinstance(handler, FastSpeech2Handler):
+    if getattr(args, "noise_reduce", False):
+        invalidate_nr_processed_disk_caches_if_manifest_mismatch(cache_base_dir, args)
+        verify_hf_audio_splits_materialized_no_audio_path(
+            train_ds=train_dataset,
+            val_ds=val_dataset,
+            test_ds=test_dataset,
+            per_split_checks=32,
+        )
+
+    if getattr(args, "noise_reduce", False) and train_ds_after_nr_before_merge is not None:
+        _prev_dir = os.path.join(cache_base_dir, "nr_preview")
+        _n_prev = save_noise_reduce_preview_wavs(
+            train_ds_after_nr_before_merge,
+            _prev_dir,
+            target_sr=target_sr,
+            n_samples=5,
+        )
+        print(
+            f"   🔊 Pré-visualização NR: {_n_prev} WAV(s) de locutores distintos em {os.path.abspath(_prev_dir)}"
+        )
+
+    if model_type in ("fastspeech2", "glow_tts") and isinstance(handler, FastSpeech2Handler):
         f0_path = os.path.join(cache_base_dir, "f0_stats.json")
         if os.path.isfile(f0_path):
             with open(f0_path, "r", encoding="utf-8") as f:
@@ -1940,6 +2559,16 @@ def main():
             processed_val_ds.set_format(type="torch")
             processed_val_ds.save_to_disk(val_cache_path)
             print(f"💾 Cache VAL salvo em: {val_cache_path}")
+
+    if test_dataset is not None and getattr(args, "noise_reduce", False):
+        if os.path.exists(test_cache_path):
+            print(f"⚡ Split TESTE (HF, áudio com NR): reutilizando cache em {test_cache_path}")
+        else:
+            test_dataset.save_to_disk(test_cache_path)
+            print(f"💾 Split TESTE (áudio após NR) salvo em: {test_cache_path}")
+
+    if getattr(args, "noise_reduce", False):
+        write_nr_processed_cache_manifest(cache_base_dir, args)
 
     # 7. Training
     # train_params já definido (secção cache / multi-frase SpeechT5)
@@ -2075,7 +2704,7 @@ def main():
     elif _lb is True and not processed_val_ds:
         print("⚠️ load_best_model_at_end omitido — sem eval_dataset.")
 
-    training_args = TrainingArguments(**training_kwargs)
+    training_args = TrainingArguments(**_training_arguments_kwargs_for_version(training_kwargs))
 
     cb = [TrainingETACallback(), ValidationCallback(), PeftAdapterSaveCallback(model)]
     if model_type == "speecht5":

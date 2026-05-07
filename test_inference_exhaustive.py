@@ -52,8 +52,46 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from inference_noise_reduce import (
+    DEFAULT_NR_NOISE_CLIP_SECONDS,
+    DEFAULT_NR_PROP_DECREASE,
+    DEFAULT_NR_PEAK_MATCH,
+)
+
 # Carregar variáveis de ambiente (HF_TOKEN)
 load_dotenv()
+
+
+def _patch_hf_hub_use_auth_token_compat() -> None:
+    """
+    SpeechBrain ainda chama hf_hub_download(..., use_auth_token=...).
+    Em huggingface_hub recente o parâmetro foi substituído por ``token``.
+    """
+    try:
+        import huggingface_hub
+
+        _orig = huggingface_hub.hf_hub_download
+
+        def _hf_hub_download_compat(*args, **kwargs):
+            if "use_auth_token" in kwargs and kwargs.get("token") is None:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            else:
+                kwargs.pop("use_auth_token", None)
+            return _orig(*args, **kwargs)
+
+        huggingface_hub.hf_hub_download = _hf_hub_download_compat
+        try:
+            import huggingface_hub.file_download as _fd
+
+            if hasattr(_fd, "hf_hub_download"):
+                _fd.hf_hub_download = _hf_hub_download_compat
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_hf_hub_use_auth_token_compat()
 
 # --- 1. Monkey Patch & Setup ---
 if not hasattr(torchaudio, "list_audio_backends"):
@@ -65,6 +103,69 @@ from peft import PeftModel
 from speechbrain.inference.speaker import EncoderClassifier
 from speechbrain.utils.fetching import LocalStrategy
 from collections import Counter
+
+
+def _patch_speechbrain_fetch_optional_custom_py() -> None:
+    """
+    Muitos repos HF (ex.: spkrec-xvect-voxceleb) não têm ``custom.py``.
+    ``Pretrained.from_hparams`` só trata ausência opcional se ``fetch`` levantar
+    ``ValueError``; versões novas do hub levantam ``RemoteEntryNotFoundError`` (404).
+
+    Importante: ``interfaces.py`` faz ``from ...fetching import fetch`` (referência
+    própria). Só patchar ``fetching.fetch`` não basta — é preciso rebindar também
+    ``speechbrain.inference.interfaces.fetch`` (e outros que importam ``fetch``).
+    """
+    try:
+        import speechbrain.utils.fetching as _sb_fetch
+
+        _orig = _sb_fetch.fetch
+
+        def _fetch(*args, **kwargs):
+            try:
+                return _orig(*args, **kwargs)
+            except Exception as exc:
+                fn = kwargs.get("filename")
+                if fn is None and args:
+                    fn = args[0]
+                if str(fn) != "custom.py":
+                    raise
+                msg = str(exc).lower()
+                tnm = type(exc).__name__.lower()
+                if (
+                    "404" in msg
+                    or "not found" in msg
+                    or "remoteentry" in tnm
+                    or "entrynotfound" in tnm
+                    or "httpstatus" in tnm
+                    or "http error" in msg
+                ):
+                    raise ValueError("optional custom.py not found on Hugging Face Hub") from exc
+                raise
+
+        _sb_fetch.fetch = _fetch
+        try:
+            import speechbrain.inference.interfaces as _sb_if
+
+            _sb_if.fetch = _fetch
+        except Exception:
+            pass
+        try:
+            import speechbrain.inference.classifiers as _sb_cls
+
+            _sb_cls.fetch = _fetch
+        except Exception:
+            pass
+        try:
+            import speechbrain.utils.parameter_transfer as _sb_pt
+
+            _sb_pt.fetch = _fetch
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_speechbrain_fetch_optional_custom_py()
 
 
 def _device_for_speechbrain(device: str) -> str:
@@ -79,11 +180,47 @@ def _device_for_speechbrain(device: str) -> str:
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-def normalize_text(text):
-    if not text: return ""
-    text = text.lower() # Converter para minúsculo para bater com vocabulário
-    return ''.join(c for c in unicodedata.normalize('NFD', text)
-                   if unicodedata.category(c) != 'Mn')
+# Modo de normalização alinhado ao treino por modelo (--fastspeech2 afinado vs SpeechT5 legado).
+_INFER_NORMALIZE_FASTPITCH_STYLE = False
+_INFER_LANGUAGE_FOR_LOCALE = "pt"
+
+
+def configure_inference_normalize_for_model(model_type: str, dataset_language: Optional[str]) -> None:
+    """FastSpeech2: NFC PT (Gruut). Demais modelos: mesmo strip legacy que SpeechT5 no treino."""
+    global _INFER_NORMALIZE_FASTPITCH_STYLE, _INFER_LANGUAGE_FOR_LOCALE
+    _INFER_NORMALIZE_FASTPITCH_STYLE = model_type == "fastspeech2"
+    _INFER_LANGUAGE_FOR_LOCALE = (dataset_language if (dataset_language or "").strip() else "pt")
+
+
+def normalize_text_legacy_stripped_inference(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower().replace("\n", " ").strip()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+    )
+
+
+def normalize_text(text: str, language: Optional[str] = None) -> str:
+    """
+    Replica o treino: NFC só em FastSpeech2; SpeechT5 e restantes usam strip legado.
+    Para baseline EN do FastSpeech, passar language='en'.
+    """
+    if not _INFER_NORMALIZE_FASTPITCH_STYLE:
+        return normalize_text_legacy_stripped_inference(text)
+    if not text:
+        return ""
+    text = text.lower().replace("\n", " ").strip()
+    lang_base = (
+        language if language is not None else _INFER_LANGUAGE_FOR_LOCALE
+    ).lower().split("-")[0]
+    if lang_base in ("en",):
+        return "".join(
+            c for c in unicodedata.normalize("NFD", text)
+            if unicodedata.category(c) != "Mn"
+        )
+    return unicodedata.normalize("NFC", text)
+
 
 # Alvo de pico ao gravar WAV (evita clipping comum em vocoder / SpeechT5)
 INFERENCE_PEAK_TARGET = 0.95
@@ -386,22 +523,23 @@ def save_speecht5_reference_run_extras(
 
 
 def copy_treinado_wavs_to_subfolder(out_dir: str, subfolder: str = "treinado_wav") -> int:
-    """Cria `out_dir/subfolder` com cópias só dos .wav `*_treinado.wav` na raiz (ignora .mp3 e outros)."""
+    """Cria ``out_dir/subfolder`` só com ``{prefix}_treinado.wav`` (sem base, referência nem variantes *_nr)."""
+
+    tail = "_treinado"
     root = Path(out_dir)
     if not root.is_dir():
         return 0
     dest = root / subfolder
     dest.mkdir(parents=True, exist_ok=True)
     n = 0
-    for src in sorted(root.glob("*_treinado.*")):
-        if not src.is_file() or src.suffix.lower() != ".wav":
+    for src in sorted(root.glob("*.wav")):
+        if not src.is_file():
             continue
-        if not src.stem.lower().endswith("_treinado"):
-            continue
-        shutil.copy2(src, dest / src.name)
-        n += 1
+        if src.stem.lower().endswith(tail):
+            shutil.copy2(src, dest / src.name)
+            n += 1
     if n:
-        print(f"   📁 Cópias só *_treinado.wav → {dest} ({n} ficheiro(s); .mp3 ignorados)")
+        print(f"   📁 Cópias *_treinado.wav → {dest} ({n} ficheiro(s))")
     return n
 
 
@@ -464,7 +602,7 @@ def find_checkpoint(model_path):
         return model_path
 
 
-def load_config(config_path="config.yaml"):
+def load_config(config_path="config_train.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
@@ -1775,8 +1913,60 @@ def get_inference_handler(model_type, model_cfg, device, model_path):
         print(f"⚠️ Inferência para {model_type} não implementada.")
         sys.exit(1)
 
+DEFAULT_CONFIG_INFERENCE_YAML = Path(__file__).resolve().parent / "config_inference.yaml"
+
+
+def _peek_inference_config_path(argv: List[str]) -> Optional[str]:
+    """Lê --inference_config da linha de comando antes do ArgumentParser completo."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--inference_config" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--inference_config="):
+            return tok.split("=", 1)[1]
+        i += 1
+    return None
+
+
+def _load_inference_config_defaults(path: Path) -> Dict[str, Any]:
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"⚠️ Não foi possível ler inference_config ({path}): {exc}")
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def main():
+    ic_raw = _peek_inference_config_path(sys.argv)
+    inference_yaml_path: Optional[Path] = None
+    inference_defaults: Dict[str, Any] = {}
+
+    if ic_raw is not None:
+        s = str(ic_raw).strip()
+        if s and s.lower() not in ("none", "false", "off"):
+            inference_yaml_path = Path(s)
+            if inference_yaml_path.is_file():
+                inference_defaults = _load_inference_config_defaults(inference_yaml_path)
+            else:
+                print(f"⚠️ inference_config não encontrado ({inference_yaml_path}); usando só CLI/argparse.")
+    elif DEFAULT_CONFIG_INFERENCE_YAML.is_file():
+        inference_yaml_path = DEFAULT_CONFIG_INFERENCE_YAML
+        inference_defaults = _load_inference_config_defaults(inference_yaml_path)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--inference_config",
+        type=str,
+        default=None,
+        metavar="YAML",
+        help=(
+            "YAML com valores padrão (chaves = nomes dos argumentos longos). "
+            "Omisso: usa config_inference.yaml junto a este script, se existir. "
+            'Use "" ou none para não carregar arquivo.'
+        ),
+    )
     parser.add_argument("--model_path", "--model_dir", type=str, default=None, help="Pasta do modelo treinado (ex: ./output_cuda_8gb/fastspeech2-...)")
     parser.add_argument("--text", type=str, default=None, help="Texto customizado para gerar áudio")
     parser.add_argument(
@@ -1787,7 +1977,7 @@ def main():
     )
     parser.add_argument("--profile", type=str, default=None)
     parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml")
     parser.add_argument(
         "--apply_peak_normalization",
         action="store_true",
@@ -1898,17 +2088,77 @@ def main():
         type=str,
         default=None,
         metavar="DIR",
-        help="Só calcula F0 RMSE (treinado vs original) na pasta e grava f0_rmse.csv; não carrega modelo nem gera áudio.",
+        help=(
+            "Só calcula métricas na pasta (exige --compute_f0_rmse e/ou --compute_wer_cer), grava inference_metrics.csv; "
+            "não carrega modelo nem gera áudio."
+        ),
     )
     parser.add_argument(
         "--compute_f0_rmse",
         action="store_true",
-        help="Após inferência SpeechT5: calcula F0 RMSE na pasta de saída (treinado vs base sintético).",
+        help="Após inferência SpeechT5: calcule só métricas F0 RMSE (independente de --compute_wer_cer). CSV: inference_metrics.csv.",
     )
     parser.add_argument("--f0_sample_rate", type=int, default=16000, help="SR para YIN (deve bater com o WAV de inferência).")
     parser.add_argument("--f0_hop_length", type=int, default=256, help="hop_length do librosa.yin (reprodutibilidade).")
     parser.add_argument("--f0_fmin", type=float, default=50.0)
     parser.add_argument("--f0_fmax", type=float, default=500.0)
+    parser.add_argument(
+        "--noise_reduce",
+        action="store_true",
+        help=(
+            "Grava {prefix}_base_nr.wav, {prefix}_referencia_nr.wav (se referência WAV existir), "
+            "e {prefix}_treinado_nr.wav por noisereduce (alinhado a noise_remove_test.py). "
+            "Não altera inference_metrics.csv: métricas usam sempre *_base / *_treinado / *_referencia sem NR."
+        ),
+    )
+    parser.add_argument(
+        "--noise_clip_sec",
+        type=float,
+        default=DEFAULT_NR_NOISE_CLIP_SECONDS,
+        metavar="SEC",
+        help="Segundos iniciais do clip como estimativa de ruído (noisereduce).",
+    )
+    parser.add_argument(
+        "--noise_prop_decrease",
+        type=float,
+        default=DEFAULT_NR_PROP_DECREASE,
+        metavar="P",
+        help="Prop. decrease noisereduce [0,1] (alinhado ao treino e a inference_noise_reduce).",
+    )
+    parser.add_argument(
+        "--no_noise_peak_match",
+        action="store_true",
+        help="Não aplicar igualação de pico após NR nos WAVs *_nr gravados.",
+    )
+    parser.add_argument(
+        "--compute_wer_cer",
+        action="store_true",
+        help=(
+            "Após inferência: calcule só WER/CER vs transcrição de referência (independente de --compute_f0_rmse). "
+            "Requer transformers/Whisper."
+        ),
+    )
+    parser.add_argument(
+        "--wer_cer_whisper_model",
+        type=str,
+        default="openai/whisper-small",
+        metavar="HF_ID",
+        help="Modelo ASR para WER/CER (Whisper no HF).",
+    )
+    parser.add_argument(
+        "--wer_cer_whisper_language",
+        type=str,
+        default="portuguese",
+        metavar="LANG",
+        help="Idioma passado ao pipeline ASR (ex.: portuguese).",
+    )
+    parser.add_argument(
+        "--wer_cer_device",
+        type=str,
+        default=None,
+        metavar="DEVICE",
+        help="Dispositivo ASR (cuda | cpu). Omisso = mesmo do perfil de hardware do teste.",
+    )
     parser.add_argument(
         "--dataset_reference_audios",
         action="store_true",
@@ -1929,8 +2179,9 @@ def main():
         "--infer_all_test_sentences",
         action="store_true",
         help=(
-            "SpeechT5 + --dataset_reference_audios: inferir sobre todas as frases do conjunto de teste (sem subamostragem). "
-            "Ignora --dataset_train_reference_audios neste run. Não combinar com --text."
+            "Todas as frases do conjunto de teste (sem subamostragem). SpeechT5: exige --dataset_reference_audios. "
+            "FastSpeech2: carrega o split de teste (export ou stream); ignora --dataset_train_reference_audios neste run. "
+            "Não combinar com --text."
         ),
     )
     parser.add_argument(
@@ -2056,13 +2307,24 @@ def main():
             "Omitir = ordem determinística por id de sentença."
         ),
     )
+    allowed_dest = {a.dest for a in parser._actions if getattr(a, "dest", None) not in (None, "help")}
+    cfg_filtered = {k: v for k, v in inference_defaults.items() if k in allowed_dest}
+    parser.set_defaults(**cfg_filtered)
+
     args = parser.parse_args()
+    if inference_yaml_path is not None:
+        print(f"📄 inference_config: {inference_yaml_path}")
 
     if getattr(args, "only_f0_rmse_dir", None):
+        cf0 = bool(getattr(args, "compute_f0_rmse", False))
+        cwer = bool(getattr(args, "compute_wer_cer", False))
+        if not cf0 and not cwer:
+            print("❌ --only_f0_rmse_dir requer --compute_f0_rmse e/ou --compute_wer_cer.")
+            sys.exit(1)
         from f0_infer_metrics import (
             compute_metrics_for_inference_dir,
-            summarize_f0_metrics_rows,
-            summarize_f0_metrics_vs_reference,
+            summarize_f0_rmse_inference,
+            summarize_wer_cer_inference,
             write_metrics_csv,
         )
 
@@ -2076,18 +2338,41 @@ def main():
             hop_length=args.f0_hop_length,
             fmin=args.f0_fmin,
             fmax=args.f0_fmax,
+            compute_f0=cf0,
+            noise_reduce=bool(getattr(args, "noise_reduce", False)),
+            noise_clip_seconds=float(
+                getattr(args, "noise_clip_sec", DEFAULT_NR_NOISE_CLIP_SECONDS) or DEFAULT_NR_NOISE_CLIP_SECONDS
+            ),
+            nr_prop_decrease=float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE)),
+            nr_peak_match=not bool(getattr(args, "no_noise_peak_match", False)),
+            wer_cer=cwer,
+            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-small")),
+            whisper_language=str(getattr(args, "wer_cer_whisper_language", "portuguese")),
+            asr_device=str(getattr(args, "wer_cer_device", None) or "cuda"),
+            references_map=None,
         )
-        out_csv = os.path.join(od, "f0_rmse.csv")
+        out_csv = os.path.join(od, "inference_metrics.csv")
         write_metrics_csv(rows, out_csv)
-        mean_hz, valid_n, total_n = summarize_f0_metrics_rows(rows)
-        mo, ko, mt, kt = summarize_f0_metrics_vs_reference(rows)
-        print(f"\n📈 F0 RMSE só-métrica: {total_n} linhas | treinado-vs-base válidos={valid_n}")
-        if np.isfinite(mean_hz):
-            print(f"   Média treinado(LoRA) vs base sintét.: {mean_hz:.4f} Hz")
-        if ko > 0 or kt > 0:
-            print(f"   Base vs WAV dataset (n={ko}): {mo:.4f} Hz")
-            print(f"   LoRA vs WAV dataset (n={kt}): {mt:.4f} Hz")
-        print(f"   📄 {out_csv}")
+        print(f"\n📈 Métricas só-pasta: {len(rows)} linhas -> {out_csv}")
+        if cf0:
+            mo, ko, mt, kt = summarize_f0_rmse_inference(rows)
+            if ko > 0 or kt > 0:
+                if np.isfinite(mo):
+                    print(f"   F0 RMSE médio base vs WAV ref. (n={ko}): {mo:.4f} Hz")
+                if np.isfinite(mt):
+                    print(f"   F0 RMSE médio LoRA vs WAV ref. (n={kt}): {mt:.4f} Hz")
+        if cwer:
+            mb, nb, mt_w, nt_w = summarize_wer_cer_inference(rows)
+            if nb > 0 and np.isfinite(mb):
+                print(f"   WER médio base (n={nb}): {100.0 * mb:.2f}%")
+            if nt_w > 0 and np.isfinite(mt_w):
+                print(f"   WER médio LoRA (n={nt_w}): {100.0 * mt_w:.2f}%")
+            print("   CER: cer_base / cer_treinado no CSV.")
+        if getattr(args, "noise_reduce", False):
+            print(
+                "   Noisereduce: só gera cópias *_base_nr / *_referencia_nr / *_treinado_nr.wav na inferência; "
+                "métricas usam sempre os WAV originais."
+            )
         sys.exit(0)
 
     if not getattr(args, "model_path", None):
@@ -2097,15 +2382,21 @@ def main():
     dataset_name = args.dataset or full_cfg.get('settings', {}).get('default_dataset_profile', 'lapsbm_fastspeech2')
     ds_cfg = full_cfg['dataset_profiles'][dataset_name]
     model_type = ds_cfg.get('model_type', 'fastspeech2')
+    configure_inference_normalize_for_model(model_type, ds_cfg.get("language", "pt"))
     model_cfg = full_cfg['models'][model_type]
 
     infer_all_test = bool(getattr(args, "infer_all_test_sentences", False))
     if infer_all_test:
-        if model_type != "speecht5":
-            print("❌ --infer_all_test_sentences só é suportado com perfil SpeechT5.")
+        if model_type not in ("speecht5", "fastspeech2"):
+            print(
+                "❌ --infer_all_test_sentences só é suportado com perfis SpeechT5 ou FastSpeech2."
+            )
             sys.exit(1)
-        if not getattr(args, "dataset_reference_audios", False):
-            print("❌ --infer_all_test_sentences requer --dataset_reference_audios.")
+        if model_type == "speecht5" and not getattr(args, "dataset_reference_audios", False):
+            print(
+                "❌ --infer_all_test_sentences (SpeechT5) requer --dataset_reference_audios "
+                "(WAV + x-vector por frase)."
+            )
             sys.exit(1)
     
     hw_name = args.profile or detect_hardware_profile()
@@ -2159,11 +2450,22 @@ def main():
             + (f"DC + HP {hpf:.0f} Hz anti-subgrave rum" if hpf > 0 else "sem HP (--speecht5_inference_highpass_hz 0)")
         )
     print(
-        "   📉 F0 RMSE inferência:"
+        "   📉 Métricas pós-inferência (inference_metrics.csv): "
         + (
-            " ativo (--compute_f0_rmse após SpeechT5)"
-            if getattr(args, "compute_f0_rmse", False)
-            else " desativo"
+            (
+                ("F0 RMSE " if getattr(args, "compute_f0_rmse", False) else "")
+                + ("WER/CER " if getattr(args, "compute_wer_cer", False) else "")
+                + (
+                    "(+ WAV NR paralelos) "
+                    if getattr(args, "noise_reduce", False)
+                    else ""
+                )
+            ).strip()
+            if (
+                getattr(args, "compute_f0_rmse", False)
+                or getattr(args, "compute_wer_cer", False)
+            )
+            else "desativas (--compute_f0_rmse e/ou --compute_wer_cer)"
         )
     )
     if getattr(args, "no_mp3", False):
@@ -2264,6 +2566,7 @@ def main():
 
     has_ds_test = getattr(args, "dataset_reference_audios", False) and model_type == "speecht5"
     has_ds_train = getattr(args, "dataset_train_reference_audios", False) and model_type == "speecht5"
+    infer_all_fastspeech2 = infer_all_test and model_type == "fastspeech2"
 
     if infer_all_test:
         if stripped_user:
@@ -2275,12 +2578,46 @@ def main():
             )
             has_ds_train = False
 
-    if has_ds_test or has_ds_train:
+    if has_ds_test or has_ds_train or infer_all_fastspeech2:
         merged_rows: List[InferenceCandidate] = []
         n_frm_test_split = 0
         n_frm_train_split = 0
 
-        if has_ds_test:
+        if infer_all_fastspeech2:
+            test_pool = load_inference_test_candidates(full_cfg, ds_cfg, dataset_name)
+            test_part = random_pick_inference_candidates(
+                test_pool,
+                limit=1,
+                seed=None,
+                take_all=True,
+            )
+            print(
+                f"   🎙️ FastSpeech2: conjunto de teste completo — {len(test_part)} "
+                "sentença(s) (sem subamostragem)."
+            )
+            if not test_part:
+                print(
+                    "❌ Sem amostras de teste no dataset (--infer_all_test_sentences). "
+                    "Confirma export `test_split_inferencia/.../hf_test_split` ou cache HF."
+                )
+                sys.exit(1)
+            merged_rows.extend(test_part)
+            n_frm_test_split = len(test_part)
+            if len(test_part) > 48:
+                print(
+                    f"   🧾 Lista de amostras omitida no terminal ({len(test_part)} itens); "
+                    "ver sentencas.txt na pasta de saída."
+                )
+            else:
+                print_inference_sample_banner(
+                    test_part,
+                    "🧾 Conjunto de teste completo (FastSpeech2):",
+                )
+            print(
+                "   📌 Neste script, --compute_f0_rmse / --compute_wer_cer após inferência aplicam-se "
+                "apenas a SpeechT5; aqui são gerados só os WAV (LJS / PT base / PT LoRA)."
+            )
+        elif has_ds_test:
             if not stripped_user:
                 test_pool = load_inference_test_candidates(full_cfg, ds_cfg, dataset_name)
                 if infer_all_test:
@@ -2321,7 +2658,7 @@ def main():
                             else "🧾 Amostras escolhidas (teste) — F0 RMSE vs WAV do mesmo locutor:"
                         ),
                     )
-                    print("   📌 Sugestão: --compute_f0_rmse para RMSE contra *_referencia.wav.")
+                    print("   📌 Sugestão: --compute_f0_rmse (e opcionalmente --compute_wer_cer) para inference_metrics.csv.")
             else:
                 pool = random_pick_inference_candidates(
                     load_inference_test_candidates(full_cfg, ds_cfg, dataset_name),
@@ -2333,7 +2670,7 @@ def main():
                 n_frm_test_split = 1 + len(pool)
                 print(f"   🎙️ Texto CLI + subset teste dataset: {n_frm_test_split} sentença(s)")
                 print_inference_sample_banner(pool, "🧾 Amostras aleatórias do teste (2ª em diante):")
-                print("   📌 --compute_f0_rmse quando existir WAV de referência.")
+                print("   📌 --compute_f0_rmse e/ou --compute_wer_cer quando existir WAV de referência e transcrições.")
 
         if has_ds_train:
             train_pool = load_inference_train_candidates(full_cfg, ds_cfg, dataset_name)
@@ -2380,6 +2717,11 @@ def main():
                 "   📊 Total neste run: "
                 f"{len(inference_run_rows)} (= {n_frm_test_split} teste + {n_frm_train_split} treino).\n"
                 "   📎 Ordem: subset teste; depois subset treino.",
+            )
+        elif infer_all_fastspeech2:
+            print(
+                f"   📊 Total de sentenças neste run: {len(inference_run_rows)} "
+                "(FastSpeech2, conjunto de teste completo)."
             )
     elif stripped_user:
         test_texts = [stripped_user]
@@ -2537,6 +2879,14 @@ def main():
         model_cfg.get("speaker_encoder_id", "speechbrain/spkrec-xvect-voxceleb")
     )
     speecht5_encoder_sr = int(model_cfg.get("sampling_rate", 16000))
+
+    _nr_wav_kw = {
+        "noise_clip_seconds": float(
+            getattr(args, "noise_clip_sec", DEFAULT_NR_NOISE_CLIP_SECONDS) or DEFAULT_NR_NOISE_CLIP_SECONDS
+        ),
+        "prop_decrease": float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE)),
+        "peak_match": not bool(getattr(args, "no_noise_peak_match", False)),
+    }
 
     # 5. Executar Inferência
     for i, text in enumerate(test_texts):
@@ -2721,13 +3071,37 @@ def main():
                 print(f"   ⚠️ Erro (LoRA+PT): {e}")
         else:
             # Outros modelos: mantém pares base vs LoRA
-            print(f"   🔊 Gerando ORIGINAL (base sem LoRA)...")
+            print(f"   🔊 Gerando BASE (SpeechT5 sem LoRA)...")
             try:
                 audio_orig = handler.generate(clean_text, gen_spk, use_lora=False)
-                p_orig = os.path.join(out_dir, f"{prefix}_original.wav")
+                p_base_wav = os.path.join(out_dir, f"{prefix}_base.wav")
                 audio_orig_out = _finalize_audio(audio_orig, is_trained=False)
-                write_wav_and_mp3(p_orig, audio_orig_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_orig, audio_orig_out, sampling_rate)
+                write_wav_and_mp3(p_base_wav, audio_orig_out, sampling_rate, **_mp3_kw)
+                _wav_report(p_base_wav, audio_orig_out, sampling_rate)
+                if getattr(args, "noise_reduce", False):
+                    try:
+                        from inference_noise_reduce import apply_noise_reduce_to_wav_file
+
+                        p_base_nr = os.path.join(out_dir, f"{prefix}_base_nr.wav")
+                        nr_warn_b, dmax_b, ys_b = apply_noise_reduce_to_wav_file(
+                            p_base_wav,
+                            p_base_nr,
+                            **_nr_wav_kw,
+                        )
+                        if nr_warn_b:
+                            print(f"      ⚠️ {prefix}_base_nr.wav: noisereduce — {nr_warn_b}")
+                        elif dmax_b <= 1e-6 * ys_b:
+                            print(
+                                f"      ⚠️ {os.path.basename(p_base_nr)} muito parecido com _base.wav "
+                                f"(Δmáx={dmax_b:.2e})."
+                            )
+                        else:
+                            print(
+                                f"      🧹 Gravado {os.path.basename(p_base_nr)} "
+                                f"(NR sobre {os.path.basename(p_base_wav)})"
+                            )
+                    except Exception as e_bnr:
+                        print(f"      ⚠️ Falha ao gravar *_base_nr.wav: {e_bnr}")
                 if effective_cand is not None and model_type == "speecht5" and effective_cand.dataset_item is not None:
                     ya, sra = resolve_reference_waveform_for_inference(
                         effective_cand.dataset_item,
@@ -2739,6 +3113,30 @@ def main():
                         p_refs = os.path.join(out_dir, f"{prefix}_referencia.wav")
                         write_wav_and_mp3(p_refs, np.asarray(ya, dtype=np.float32), int(sra), **_mp3_kw)
                         _wav_report(p_refs, ya, int(sra))
+                        if getattr(args, "noise_reduce", False):
+                            try:
+                                from inference_noise_reduce import apply_noise_reduce_to_wav_file
+
+                                p_refs_nr = os.path.join(out_dir, f"{prefix}_referencia_nr.wav")
+                                nr_warn_r, dmax_r, ys_r = apply_noise_reduce_to_wav_file(
+                                    p_refs,
+                                    p_refs_nr,
+                                    **_nr_wav_kw,
+                                )
+                                if nr_warn_r:
+                                    print(f"      ⚠️ {prefix}_referencia_nr.wav: noisereduce — {nr_warn_r}")
+                                elif dmax_r <= 1e-6 * ys_r:
+                                    print(
+                                        f"      ⚠️ {os.path.basename(p_refs_nr)} muito parecido com _referencia.wav "
+                                        f"(Δmáx={dmax_r:.2e})."
+                                    )
+                                else:
+                                    print(
+                                        f"      🧹 Gravado {os.path.basename(p_refs_nr)} "
+                                        f"(NR sobre {os.path.basename(p_refs)})"
+                                    )
+                            except Exception as e_rnr:
+                                print(f"      ⚠️ Falha ao gravar *_referencia_nr.wav: {e_rnr}")
                         if model_type == "speecht5":
                             save_speecht5_reference_run_extras(
                                 out_dir,
@@ -2757,7 +3155,7 @@ def main():
                             f"test_split_inferencia/{dataset_name}/audio/<locutor>/)."
                         )
             except Exception as e:
-                print(f"   ⚠️ Erro no modelo original: {e}")
+                print(f"   ⚠️ Erro no modelo base (sem LoRA): {e}")
                 audio_orig = None
 
             print(f"   🔥 Gerando TREINADO (LoRA)...")
@@ -2767,43 +3165,98 @@ def main():
                 audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
                 write_wav_and_mp3(p_lora, audio_lora_out, sampling_rate, **_mp3_kw)
                 _wav_report(p_lora, audio_lora_out, sampling_rate)
+                if getattr(args, "noise_reduce", False):
+                    try:
+                        from inference_noise_reduce import apply_noise_reduce_to_wav_file
+
+                        p_lora_nr = os.path.join(out_dir, f"{prefix}_treinado_nr.wav")
+                        nr_warn, dmax, yscale = apply_noise_reduce_to_wav_file(
+                            p_lora,
+                            p_lora_nr,
+                            **_nr_wav_kw,
+                        )
+                        if nr_warn:
+                            print(f"      ⚠️ {prefix}_treinado_nr.wav: noisereduce — {nr_warn}")
+                        elif dmax <= 1e-6 * yscale:
+                            print(
+                                f"      ⚠️ {os.path.basename(p_lora_nr)} muito parecido com treinado.wav "
+                                f"(Δmáx={dmax:.2e} vs leitura scipy do .wav). Perfil de ruído fraco ou sinal já limpo."
+                            )
+                        else:
+                            print(
+                                f"      🧹 Gravado {os.path.basename(p_lora_nr)} "
+                                f"(NR sobre o mesmo .wav que noise_remove_test.py lê; "
+                                f"Δmáx ≈ {dmax/yscale:.4f} rel. ao pico)"
+                            )
+                    except Exception as e_nr:
+                        print(f"      ⚠️ Falha ao gravar *_treinado_nr.wav: {e_nr}")
                 if audio_orig is not None and len(np.asarray(audio_orig).reshape(-1)) > 0:
                     ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_orig).reshape(-1))
-                    print(f"      📊 Razão duração treinado/original ≈ {ratio:.2f}×")
+                    print(f"      📊 Razão duração treinado/base ≈ {ratio:.2f}×")
                 if args.text and i == 0:
                     write_wav_and_mp3("output_inference.wav", audio_lora_out, sampling_rate, **_mp3_kw)
             except Exception as e:
                 print(f"   ⚠️ Erro no modelo treinado: {e}")
             
-    if model_type == "speecht5" and getattr(args, "compute_f0_rmse", False):
+    if model_type == "speecht5" and (
+        getattr(args, "compute_f0_rmse", False) or getattr(args, "compute_wer_cer", False)
+    ):
         from f0_infer_metrics import (
             compute_metrics_for_inference_dir,
-            summarize_f0_metrics_rows,
-            summarize_f0_metrics_vs_reference,
+            summarize_f0_rmse_inference,
+            summarize_wer_cer_inference,
             write_metrics_csv,
         )
 
+        _asr_dev = getattr(args, "wer_cer_device", None) or device
+        cf0 = bool(getattr(args, "compute_f0_rmse", False))
+        cwer = bool(getattr(args, "compute_wer_cer", False))
         rows = compute_metrics_for_inference_dir(
             out_dir,
             sample_rate=args.f0_sample_rate,
             hop_length=args.f0_hop_length,
             fmin=args.f0_fmin,
             fmax=args.f0_fmax,
+            compute_f0=cf0,
+            noise_reduce=bool(getattr(args, "noise_reduce", False)),
+            noise_clip_seconds=float(
+                getattr(args, "noise_clip_sec", DEFAULT_NR_NOISE_CLIP_SECONDS) or DEFAULT_NR_NOISE_CLIP_SECONDS
+            ),
+            nr_prop_decrease=float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE)),
+            nr_peak_match=not bool(getattr(args, "no_noise_peak_match", False)),
+            wer_cer=cwer,
+            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-small")),
+            whisper_language=str(getattr(args, "wer_cer_whisper_language", "portuguese")),
+            asr_device=str(_asr_dev),
+            references_map=None,
         )
         if rows:
-            out_csv = os.path.join(out_dir, "f0_rmse.csv")
+            out_csv = os.path.join(out_dir, "inference_metrics.csv")
             write_metrics_csv(rows, out_csv)
-            mean_hz, valid_n, total_n = summarize_f0_metrics_rows(rows)
-            mo, ko, mt, kt = summarize_f0_metrics_vs_reference(rows)
-            print(f"\n   📉 F0 RMSE treinado-vs-base sintét.: {total_n} linhas | válidos={valid_n}")
-            if np.isfinite(mean_hz):
-                print(f"      Média: {mean_hz:.4f} Hz")
-            if ko > 0 or kt > 0:
-                print(f"      Base vs WAV referência dataset (n={ko}): {mo:.4f} Hz")
-                print(f"      LoRA vs WAV referência dataset (n={kt}): {mt:.4f} Hz")
+            print(f"\n   📉 Métricas inferência: {len(rows)} linhas em inference_metrics.csv")
+            if cf0:
+                mo, ko, mt, kt = summarize_f0_rmse_inference(rows)
+                if ko > 0 or kt > 0:
+                    if np.isfinite(mo):
+                        print(f"      F0 RMSE médio base vs WAV ref. (n={ko}): {mo:.4f} Hz")
+                    if np.isfinite(mt):
+                        print(f"      F0 RMSE médio LoRA vs WAV ref. (n={kt}): {mt:.4f} Hz")
+            if cwer:
+                mb, nb, mt_w, nt_w = summarize_wer_cer_inference(rows)
+                if nb > 0 and np.isfinite(mb):
+                    print(f"      WER médio base (n={nb}): {100.0 * mb:.2f}%")
+                if nt_w > 0 and np.isfinite(mt_w):
+                    print(f"      WER médio LoRA (n={nt_w}): {100.0 * mt_w:.2f}%")
+                print("      CER: cer_base / cer_treinado no CSV.")
+            if getattr(args, "noise_reduce", False):
+                print(
+                    "      Noisereduce: só gera *_nr.wav; métricas usam WAV originais (sem NR)."
+                )
             print(f"      📄 {out_csv}")
         else:
-            print("\n   ⚠️ compute_f0_rmse: sem pares *_original.wav / *_treinado.wav nesta pasta.")
+            print(
+                "\n   ⚠️ Métricas pós-inferência: sem pares *_base (ou legado *_original) / *_treinado nesta pasta."
+            )
 
     if model_type == "speecht5" and ref_extra_manifest:
         man_path = os.path.join(out_dir, "referencia_embeddings", "manifest.json")

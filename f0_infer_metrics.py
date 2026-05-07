@@ -16,12 +16,21 @@ import argparse
 import csv
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import librosa
 import numpy as np
+import soundfile as sf
+
+from inference_noise_reduce import (
+    DEFAULT_NR_NOISE_CLIP_SECONDS,
+    DEFAULT_NR_PROP_DECREASE,
+    DEFAULT_NR_PEAK_MATCH,
+)
 
 DEFAULT_SR = 16000
 DEFAULT_HOP_LENGTH = 256
@@ -29,6 +38,24 @@ DEFAULT_FMIN = 50.0
 DEFAULT_FMAX = 500.0
 
 _INFERENCE_PAIR_EXTS: Tuple[str, ...] = (".wav", ".mp3", ".flac", ".ogg")
+
+
+def inference_pair_prefix_sort_key(prefix: str) -> Tuple[int, int, str]:
+    """
+    Ordem de leitura/CSV alinhada a ``sentenca_1``, ``sentenca_2``, …, ``sentenca_10`` (não lexicográfica).
+
+    ``custom`` (inferência com um único texto) ordena antes das sentenças numeradas.
+    Outros prefixos vão depois, por nome em minúsculas.
+    """
+    p = (prefix or "").strip()
+    if not p:
+        return (99, 0, "")
+    if p.lower() == "custom":
+        return (-1, 0, p)
+    m = re.match(r"(?i)^sentenca_(\d+)$", p)
+    if m:
+        return (0, int(m.group(1)), p)
+    return (1, 0, p.lower())
 
 
 def shorten_path_for_csv(path_like: str | Path | None) -> str:
@@ -114,6 +141,30 @@ def f0_rmse_hz_between_wavs(
     return f0_rmse_hz_between_contours(gf, rf, voiced_min_hz=voiced_min_hz)
 
 
+def _load_mono_resampled(path: Path | str, sample_rate: int) -> np.ndarray:
+    y, _ = librosa.load(str(path), sr=sample_rate, mono=True)
+    return np.asarray(y, dtype=np.float32)
+
+
+def f0_rmse_hz_between_float_audio(
+    y_gen: np.ndarray,
+    y_ref: np.ndarray,
+    sample_rate: int,
+    *,
+    hop_length: int = DEFAULT_HOP_LENGTH,
+    fmin: float = DEFAULT_FMIN,
+    fmax: float = DEFAULT_FMAX,
+    voiced_min_hz: float = DEFAULT_FMIN,
+) -> float:
+    y_gen = np.asarray(y_gen, dtype=np.float32).reshape(-1)
+    y_ref = np.asarray(y_ref, dtype=np.float32).reshape(-1)
+    if y_gen.size == 0 or y_ref.size == 0:
+        return float("nan")
+    gf = compute_yin_f0(y_gen, sample_rate, hop_length=hop_length, fmin=fmin, fmax=fmax)
+    rf = compute_yin_f0(y_ref, sample_rate, hop_length=hop_length, fmin=fmin, fmax=fmax)
+    return f0_rmse_hz_between_contours(gf, rf, voiced_min_hz=voiced_min_hz)
+
+
 def find_referencia_path(out_dir: Path, prefix: str) -> Optional[Path]:
     """
     Ficheiro `prefix_referencia.*`. Se existir mais do que uma extensão, prefere-se a ordem em
@@ -133,9 +184,24 @@ def find_referencia_path(out_dir: Path, prefix: str) -> Optional[Path]:
     return candidates[0]
 
 
-def _pick_treinado_for_original(out_dir: Path, prefix: str, orig_suffix: str) -> Optional[Path]:
-    """Procura `{prefix}_treinado.*`: preferindo a mesma extensão que o original, depois as outras."""
-    suf = orig_suffix.lower() if orig_suffix.startswith(".") else f".{orig_suffix.lower()}"
+def treinado_nr_wav_path(out_dir: Path, prefix: str) -> Path:
+    """Ficheiro opcional gravado na inferência com ``--noise_reduce``: ``{prefix}_treinado_nr.wav``."""
+    return out_dir / f"{prefix}_treinado_nr.wav"
+
+
+def base_nr_wav_path(out_dir: Path, prefix: str) -> Path:
+    """Inferência + ``--noise_reduce``: ``{prefix}_base_nr.wav``."""
+    return out_dir / f"{prefix}_base_nr.wav"
+
+
+def referencia_nr_wav_path(out_dir: Path, prefix: str) -> Path:
+    """Inferência + ``--noise_reduce``: ``{prefix}_referencia_nr.wav``."""
+    return out_dir / f"{prefix}_referencia_nr.wav"
+
+
+def _pick_treinado_for_base(out_dir: Path, prefix: str, base_suffix: str) -> Optional[Path]:
+    """Procura `{prefix}_treinado.*`: preferindo a mesma extensão que o ficheiro base, depois as outras."""
+    suf = base_suffix.lower() if base_suffix.startswith(".") else f".{base_suffix.lower()}"
     order = [suf] + [e for e in _INFERENCE_PAIR_EXTS if e.lower() != suf]
     for e in order:
         p = out_dir / f"{prefix}_treinado{e}"
@@ -144,43 +210,55 @@ def _pick_treinado_for_original(out_dir: Path, prefix: str, orig_suffix: str) ->
     return None
 
 
-def iter_speecht5_original_treinado_pairs(out_dir: Path | str) -> Iterable[Tuple[str, Path, Path]]:
+def iter_speecht5_base_treinado_pairs(out_dir: Path | str) -> Iterable[Tuple[str, Path, Path]]:
     """
-    Emparelha `{prefix}_original.*` com `{prefix}_treinado.*`.
-    Extensões: .wav, .mp3, .flac, .ogg.
-    O treinado pode ter extensão diferente do original (ex.: .wav + .mp3).
-    Por prefixo conta-se um par (prioridade do original: wav, mp3, …).
+    Emparelha ``{prefix}_base.*`` (ou legado ``_original.*``) com ``{prefix}_treinado.*``.
+    Preferência: ``_base`` antes de ``_original``; extensões em ``_INFERENCE_PAIR_EXTS``.
+    Por prefixo conta-se um só par (prioridade do WAV base: wav, mp3, … dentro de cada grupo).
+
+    A sequência final ordena prefixos com ``inference_pair_prefix_sort_key`` (ex.: sentenca_2 antes de sentenca_10).
     """
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return
     seen: set[str] = set()
-    for ext in _INFERENCE_PAIR_EXTS:
-        tail = f"_original{ext}"
-        for orig in sorted(out_dir.glob(f"*{tail}")):
-            if not orig.is_file():
-                continue
-            if not orig.name.lower().endswith(tail.lower()):
-                continue
-            prefix = orig.name[: -len(tail)]
-            if prefix in seen:
-                continue
-            treina = _pick_treinado_for_original(out_dir, prefix, orig.suffix)
-            if treina is not None:
-                seen.add(prefix)
-                yield prefix, orig, treina
+    pairs: List[Tuple[str, Path, Path]] = []
+
+    def collect(tail_lower: str) -> None:
+        for ext in _INFERENCE_PAIR_EXTS:
+            tail = f"{tail_lower}{ext}"
+            for pb in out_dir.glob(f"*{tail}"):
+                if not pb.is_file() or not pb.name.lower().endswith(tail.lower()):
+                    continue
+                prefix = pb.name[: -len(tail)]
+                if prefix in seen:
+                    continue
+                treina = _pick_treinado_for_base(out_dir, prefix, pb.suffix)
+                if treina is not None:
+                    seen.add(prefix)
+                    pairs.append((prefix, pb, treina))
+
+    collect("_base")
+    collect("_original")
+    pairs.sort(key=lambda t: inference_pair_prefix_sort_key(t[0]))
+    yield from pairs
+
+
+def iter_speecht5_original_treinado_pairs(out_dir: Path | str) -> Iterable[Tuple[str, Path, Path]]:
+    """Compatibilidade com código antigo: igual a ``iter_speecht5_base_treinado_pairs``."""
+    yield from iter_speecht5_base_treinado_pairs(out_dir)
 
 
 def iter_inference_audio_triplets(
     out_dir: Path | str,
 ) -> Iterable[Tuple[str, Path, Path, Optional[Path]]]:
-    """prefix, original, treinado, referencia (opcional)."""
+    """prefix, base_wav (ou legado *_original.*), treinado, referencia (opcional)."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return
-    for prefix, orig, train in iter_speecht5_original_treinado_pairs(out_dir):
+    for prefix, p_base, train in iter_speecht5_base_treinado_pairs(out_dir):
         ref = find_referencia_path(out_dir, prefix)
-        yield prefix, orig, train, ref
+        yield prefix, p_base, train, ref
 
 
 def compute_metrics_for_inference_dir(
@@ -190,88 +268,202 @@ def compute_metrics_for_inference_dir(
     hop_length: int = DEFAULT_HOP_LENGTH,
     fmin: float = DEFAULT_FMIN,
     fmax: float = DEFAULT_FMAX,
+    compute_f0: bool = True,
+    noise_reduce: bool = False,
+    noise_clip_seconds: float = DEFAULT_NR_NOISE_CLIP_SECONDS,
+    nr_prop_decrease: float = DEFAULT_NR_PROP_DECREASE,
+    nr_peak_match: bool = DEFAULT_NR_PEAK_MATCH,
+    wer_cer: bool = False,
+    whisper_model: str = "openai/whisper-small",
+    whisper_language: str = "portuguese",
+    asr_device: str = "cuda",
+    references_map: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Por `{prefix}_original.*` + `{prefix}_treinado.*` (extensões podem diferir, ex. wav vs mp3):
-      Treinado vs base sintético: f0_rmse_hz_vs_base
-    Se existir `{prefix}_referencia.*`:
-      Base vs disco: f0_rmse_hz_original_vs_ref ; Treinado vs disco: f0_rmse_hz_treinado_vs_ref
+    Métricas só sobre áudio **original** (sem NR): WAV base sintético, treinado e referência do dataset.
+
+    • **WER/CER**: texto de referência (input do TTS) vs transcrição Whisper do áudio sintético (base ou LoRA).
+    • **F0 RMSE**: contour do sintético vs contour do WAV de referência (mesmo protocolo YIN/RMSE).
+
+    Os parâmetros ``noise_reduce``, ``noise_clip_seconds``, ``nr_prop_decrease`` e ``nr_peak_match``
+    mantêm a assinatura por compatibilidade com chamadores; **não entram no cálculo** das métricas
+    (o NR na inferência só gera ficheiros ``*_nr.wav`` quando activo no script de inferência).
+
+    Prefixo de ficheiros: ``*_base.*`` ou legado ``*_original.*`` ; ``*_treinado.*`` ; ``*_referencia.*``.
     """
+    _ = (noise_reduce, noise_clip_seconds, nr_prop_decrease, nr_peak_match)
     rows: List[Dict[str, Any]] = []
     out_dir = Path(out_dir)
 
-    for prefix, p_orig, p_train in iter_speecht5_original_treinado_pairs(out_dir):
-        p_ref = find_referencia_path(out_dir, prefix)
-        row: Dict[str, Any] = {
-            "pair_prefix": prefix,
-            "wav_treinado": shorten_path_for_csv(p_train),
-            "wav_original": shorten_path_for_csv(p_orig),
-            "wav_referencia": shorten_path_for_csv(p_ref) if p_ref is not None else "",
-            "f0_rmse_hz_vs_base": "",
-            "f0_rmse_hz_original_vs_ref": "",
-            "f0_rmse_hz_treinado_vs_ref": "",
-            "failure_reason": "",
-        }
-        errs: List[str] = []
+    def _fcell(x: float) -> str | float:
+        return "" if not np.isfinite(x) else float(x)
 
-        try:
-            r_base = f0_rmse_hz_between_wavs(
-                p_train,
-                p_orig,
-                sample_rate=sample_rate,
-                hop_length=hop_length,
-                fmin=fmin,
-                fmax=fmax,
-            )
-            row["f0_rmse_hz_vs_base"] = r_base if np.isfinite(r_base) else ""
-        except Exception as exc:
-            errs.append(f"trein-vs-base:{exc}")
+    ref_map: Dict[str, str] = {}
+    if wer_cer:
+        from eval_metrics_aval import load_reference_map, transcribe_wav, word_error_rate, char_error_rate
 
-        if p_ref is not None:
-            try:
-                r_o = f0_rmse_hz_between_wavs(
-                    p_orig,
-                    p_ref,
-                    sample_rate=sample_rate,
-                    hop_length=hop_length,
-                    fmin=fmin,
-                    fmax=fmax,
+        ref_map = dict(references_map) if references_map else {}
+        if not ref_map:
+            ref_map = load_reference_map(out_dir, None)
+
+    dev = str(asr_device).strip()
+    if wer_cer and dev.lower() == "cuda":
+        import torch
+
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tmpdir: Optional[str] = None
+    if wer_cer:
+        tmpdir = tempfile.mkdtemp(prefix="infer_asr_")
+
+    try:
+        for prefix, p_base, p_train in iter_speecht5_base_treinado_pairs(out_dir):
+            p_ref = find_referencia_path(out_dir, prefix)
+
+            pair_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
+
+            def _get_mono(path: Path) -> np.ndarray:
+                k = ("mono", str(path.resolve()), int(sample_rate))
+                if k not in pair_cache:
+                    pair_cache[k] = _load_mono_resampled(path, sample_rate)
+                return pair_cache[k]
+
+            def base_raw() -> np.ndarray:
+                k = ("braw", str(p_base.resolve()), int(sample_rate))
+                if k not in pair_cache:
+                    pair_cache[k] = _get_mono(p_base)
+                return pair_cache[k]
+
+            def treinado_raw() -> np.ndarray:
+                k = ("traw", str(p_train.resolve()), int(sample_rate))
+                if k not in pair_cache:
+                    pair_cache[k] = _get_mono(p_train)
+                return pair_cache[k]
+
+            row: Dict[str, Any] = {
+                "pair_prefix": prefix,
+                "wer_base": "",
+                "wer_treinado": "",
+                "cer_base": "",
+                "cer_treinado": "",
+                "f0_rmse_base": "",
+                "f0_rmse_treinado": "",
+                "failure_reason": "",
+                "wav_base": shorten_path_for_csv(p_base),
+                "wav_treinado": shorten_path_for_csv(p_train),
+                "wav_referencia": shorten_path_for_csv(p_ref) if p_ref is not None else "",
+            }
+            errs: List[str] = []
+
+            def _metric_f0(gen: np.ndarray, ref: np.ndarray) -> float:
+                return float(
+                    f0_rmse_hz_between_float_audio(
+                        gen,
+                        ref,
+                        sample_rate,
+                        hop_length=hop_length,
+                        fmin=fmin,
+                        fmax=fmax,
+                    )
                 )
-                row["f0_rmse_hz_original_vs_ref"] = r_o if np.isfinite(r_o) else ""
-            except Exception as exc:
-                errs.append(f"original-vs-ref:{exc}")
-            try:
-                r_t = f0_rmse_hz_between_wavs(
-                    p_train,
-                    p_ref,
-                    sample_rate=sample_rate,
-                    hop_length=hop_length,
-                    fmin=fmin,
-                    fmax=fmax,
-                )
-                row["f0_rmse_hz_treinado_vs_ref"] = r_t if np.isfinite(r_t) else ""
-            except Exception as exc:
-                errs.append(f"trein-vs-ref:{exc}")
 
-        if errs:
-            row["failure_reason"] = "; ".join(errs)
-        rows.append(row)
+            if compute_f0:
+                if p_ref is None:
+                    errs.append("sem_wav_referencia_f0")
+                else:
+                    try:
+                        y_b = base_raw()
+                        y_t = treinado_raw()
+                        y_r = _get_mono(p_ref)
+                        row["f0_rmse_base"] = _fcell(_metric_f0(y_b, y_r))
+                        row["f0_rmse_treinado"] = _fcell(_metric_f0(y_t, y_r))
+                    except Exception as exc:
+                        errs.append(f"f0-vs-ref:{exc}")
+
+            if wer_cer and tmpdir is not None:
+                safe = re.sub(r"[^\w\-]+", "_", prefix)[:80]
+                ref_text_for_wer = (ref_map.get(prefix) or "").strip()
+                if not ref_text_for_wer and p_ref is not None:
+                    for sidecar in (
+                        p_ref.with_suffix(".txt"),
+                        out_dir / Path(p_ref.name).with_suffix(".txt"),
+                    ):
+                        if sidecar.is_file():
+                            ref_text_for_wer = sidecar.read_text(encoding="utf-8").strip()
+                            break
+                if not ref_text_for_wer:
+                    tp = out_dir / f"{prefix}.txt"
+                    if tp.is_file():
+                        ref_text_for_wer = tp.read_text(encoding="utf-8").strip()
+                rtxt = out_dir / "referencia_sentencas" / f"{prefix}_referencia.txt"
+                if not ref_text_for_wer and rtxt.is_file():
+                    ref_text_for_wer = rtxt.read_text(encoding="utf-8").strip()
+
+                if not ref_text_for_wer:
+                    errs.append("sem_texto_referencia_wer_cer")
+                else:
+                    try:
+                        yo = base_raw()
+                        yt0 = treinado_raw()
+                        pb0 = Path(tmpdir) / f"{safe}_asr_base.wav"
+                        pt0 = Path(tmpdir) / f"{safe}_asr_treinado.wav"
+                        sf.write(str(pb0), yo, sample_rate)
+                        sf.write(str(pt0), yt0, sample_rate)
+                        hyp_b = transcribe_wav(pb0, language=whisper_language, model_id=whisper_model, device=dev)
+                        hyp_t0 = transcribe_wav(pt0, language=whisper_language, model_id=whisper_model, device=dev)
+                        row["wer_base"] = word_error_rate(ref_text_for_wer, hyp_b)
+                        row["wer_treinado"] = word_error_rate(ref_text_for_wer, hyp_t0)
+                        row["cer_base"] = char_error_rate(ref_text_for_wer, hyp_b)
+                        row["cer_treinado"] = char_error_rate(ref_text_for_wer, hyp_t0)
+                    except Exception as exc:
+                        errs.append(f"wer_cer:{exc}")
+
+            if errs:
+                row["failure_reason"] = "; ".join(errs)
+            rows.append(row)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     return rows
+
+
+INFERENCE_METRICS_CSV_COLUMN_ORDER: List[str] = [
+    "pair_prefix",
+    "wer_base",
+    "wer_treinado",
+    "cer_base",
+    "cer_treinado",
+    "f0_rmse_base",
+    "f0_rmse_treinado",
+    "failure_reason",
+    "wav_base",
+    "wav_treinado",
+    "wav_referencia",
+]
 
 
 def write_metrics_csv(rows: List[Dict[str, Any]], out_csv: Path | str) -> None:
     out_csv = Path(out_csv)
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: inference_pair_prefix_sort_key(str(r.get("pair_prefix", "") or "")),
+    )
     keys: set[str] = set()
-    for r in rows:
+    for r in rows_sorted:
         keys.update(r.keys())
-    pref_order = ["pair_prefix", "wav_original", "wav_treinado", "wav_referencia"]
-    rest = sorted(k for k in keys if k not in pref_order and k != "failure_reason")
-    fieldnames = [k for k in pref_order if k in keys] + rest + (["failure_reason"] if "failure_reason" in keys else [])
+    ordered: List[str] = []
+    for k in INFERENCE_METRICS_CSV_COLUMN_ORDER:
+        if k in keys:
+            ordered.append(k)
+    for k in sorted(keys):
+        if k not in ordered:
+            ordered.append(k)
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=ordered, extrasaction="ignore")
         w.writeheader()
-        for row in rows:
+        for row in rows_sorted:
             w.writerow(row)
 
 
@@ -293,62 +485,122 @@ def _mean_column(rows: List[Dict[str, Any]], key: str) -> Tuple[float, int]:
     return float(np.mean(vals)), len(vals)
 
 
-def summarize_f0_metrics_rows(rows: List[Dict[str, Any]]) -> Tuple[float, int, int]:
-    """Retrocompatível: médias na coluna trein-vs-base sintético."""
-    total = len(rows)
-    mv, kv = _mean_column(rows, "f0_rmse_hz_vs_base")
-    return mv, kv, total
-
-
-def summarize_f0_metrics_vs_reference(rows: List[Dict[str, Any]]) -> Tuple[float, int, float, int]:
-    """Médias: base vs WAV do dataset ; treinado vs WAV do dataset."""
-    mo, ko = _mean_column(rows, "f0_rmse_hz_original_vs_ref")
-    mt, kt = _mean_column(rows, "f0_rmse_hz_treinado_vs_ref")
+def summarize_f0_rmse_inference(rows: List[Dict[str, Any]]) -> Tuple[float, int, float, int]:
+    """Médias ``f0_rmse_base`` e ``f0_rmse_treinado`` (sintético vs WAV de referência)."""
+    mo, ko = _mean_column(rows, "f0_rmse_base")
+    mt, kt = _mean_column(rows, "f0_rmse_treinado")
     return mo, ko, mt, kt
+
+
+def summarize_wer_cer_inference(rows: List[Dict[str, Any]]) -> Tuple[float, int, float, int]:
+    """Médias ``wer_base`` e ``wer_treinado``."""
+    mb, nb = _mean_column(rows, "wer_base")
+    mt, nt = _mean_column(rows, "wer_treinado")
+    return mb, nb, mt, nt
 
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Calcula F0 RMSE (treinado vs original) sobre pastas de inferência SpeechT5.")
-    parser.add_argument("out_dir", type=str, help="Pasta com pares *_original / *_treinado (.wav, .mp3, …)")
+    parser = argparse.ArgumentParser(
+        description="Calcula métricas (F0 RMSE; opcional WER/CER) sobre pastas de inferência SpeechT5."
+    )
+    parser.add_argument("out_dir", type=str, help="Pasta com pares *_base (ou legado *_original) / *_treinado (.wav, .mp3, …)")
     parser.add_argument("--sample_rate", type=int, default=DEFAULT_SR)
     parser.add_argument("--hop_length", type=int, default=DEFAULT_HOP_LENGTH)
     parser.add_argument("--fmin", type=float, default=DEFAULT_FMIN)
     parser.add_argument("--fmax", type=float, default=DEFAULT_FMAX)
+    parser.add_argument(
+        "--noise_reduce",
+        action="store_true",
+        help=(
+            "Compatibilidade de CLI: as métricas em CSV não usam NR; só o script de inferência "
+            "grava *_nr.wav quando activo."
+        ),
+    )
+    parser.add_argument(
+        "--noise_clip_sec",
+        type=float,
+        default=DEFAULT_NR_NOISE_CLIP_SECONDS,
+        help="(Ignorado aqui; só inferência usa NR.) Mantido por compatibilidade de CLI.",
+    )
+    parser.add_argument(
+        "--noise_prop_decrease",
+        type=float,
+        default=DEFAULT_NR_PROP_DECREASE,
+        metavar="P",
+        help="(Ignorado aqui.) Mantido por compatibilidade de CLI.",
+    )
+    parser.add_argument(
+        "--no_nr_peak_match",
+        action="store_true",
+        help="(Ignorado aqui.) Mantido por compatibilidade de CLI.",
+    )
+    parser.add_argument(
+        "--no-f0",
+        dest="compute_f0",
+        action="store_false",
+        help="Não calcular F0 RMSE (útil com --wer-cer para só ASR).",
+    )
+    parser.set_defaults(compute_f0=True)
+    parser.add_argument("--wer-cer", dest="wer_cer", action="store_true", help="WER/CER com Whisper + texto de referência.")
+    parser.add_argument("--wer_cer_whisper_model", type=str, default="openai/whisper-small")
+    parser.add_argument("--wer_cer_whisper_language", type=str, default="portuguese")
+    parser.add_argument(
+        "--wer_cer_device",
+        type=str,
+        default=None,
+        help="cuda | cpu. Omisso: cuda se disponível, senão cpu.",
+    )
     args = parser.parse_args(argv)
+
+    if not args.compute_f0 and not args.wer_cer:
+        print("[erro] Sem métricas: use F0 (por defeito), ou --wer-cer, ou ambos (--no-f0 --wer-cer para só ASR).", file=sys.stderr)
+        return 2
 
     out_dir = Path(args.out_dir)
     if not out_dir.is_dir():
         print(f"[erro] Pasta inexistente: {out_dir}", file=sys.stderr)
         return 1
 
+    _dev = args.wer_cer_device or "cuda"
     rows = compute_metrics_for_inference_dir(
         out_dir,
         sample_rate=args.sample_rate,
         hop_length=args.hop_length,
         fmin=args.fmin,
         fmax=args.fmax,
+        compute_f0=bool(args.compute_f0),
+        noise_reduce=bool(args.noise_reduce),
+        noise_clip_seconds=float(args.noise_clip_sec),
+        nr_prop_decrease=float(args.noise_prop_decrease),
+        nr_peak_match=not bool(args.no_nr_peak_match),
+        wer_cer=bool(args.wer_cer),
+        whisper_model=str(args.wer_cer_whisper_model),
+        whisper_language=str(args.wer_cer_whisper_language),
+        asr_device=str(_dev),
+        references_map=None,
     )
     if not rows:
-        print(f"[aviso] Nenhum par *_original / *_treinado (.wav, .mp3, …) em {out_dir}")
+        print(f"[aviso] Nenhum par *_base / *_treinado (.wav, .mp3, …) nem legado *_original em {out_dir}")
         return 0
 
-    csv_path = out_dir / "f0_rmse.csv"
+    csv_path = out_dir / "inference_metrics.csv"
     write_metrics_csv(rows, csv_path)
-    mean_hz, valid_n, total_n = summarize_f0_metrics_rows(rows)
-    mo, ko, mt, kt = summarize_f0_metrics_vs_reference(rows)
-    print(f"[ok] {total_n} prefixos avaliados | RMSE train-vs-base validos={valid_n}")
-    print(
-        f"   F0 RMSE medio treinado(LoRA) vs base sintetico: {mean_hz:.4f} Hz"
-        if np.isfinite(mean_hz)
-        else "   [aviso] Sem RMSE treinado(LoRA) vs base sintético"
-    )
-    if ko > 0 or kt > 0:
-        if np.isfinite(mo):
-            print(f"   F0 RMSE medio base sintet vs WAV dataset ({ko} valores): {mo:.4f} Hz")
-        if np.isfinite(mt):
-            print(f"   F0 RMSE medio LoRA vs WAV dataset ({kt} valores): {mt:.4f} Hz")
-    print(f"   CSV: {csv_path.resolve()}")
+    print(f"[ok] {len(rows)} prefixos avaliados -> {csv_path.resolve()}")
+    if args.compute_f0:
+        mo, ko, mt, kt = summarize_f0_rmse_inference(rows)
+        if ko > 0 or kt > 0:
+            if np.isfinite(mo):
+                print(f"   F0 RMSE médio base vs WAV ref. (n={ko}): {mo:.4f} Hz")
+            if np.isfinite(mt):
+                print(f"   F0 RMSE médio LoRA vs WAV ref. (n={kt}): {mt:.4f} Hz")
+    if args.wer_cer:
+        mb, nb, mt_w, nt_w = summarize_wer_cer_inference(rows)
+        if nb > 0 and np.isfinite(mb):
+            print(f"   WER médio base (n={nb}): {100.0 * mb:.2f}%")
+        if nt_w > 0 and np.isfinite(mt_w):
+            print(f"   WER médio LoRA (n={nt_w}): {100.0 * mt_w:.2f}%")
+        print("   CER: colunas cer_base / cer_treinado no CSV.")
     return 0
 
 

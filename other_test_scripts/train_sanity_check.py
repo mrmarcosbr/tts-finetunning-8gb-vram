@@ -11,8 +11,15 @@ from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, Tr
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
 import numpy as np
-import librosa
+import sys
+from pathlib import Path
+
 import soundfile as sf
+
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+from speecht5_mel_utils import waveform_to_speecht5_label_tensor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
@@ -77,20 +84,11 @@ def main():
         text = batch.get("text", batch.get("txt", "dummy"))
         batch["input_ids"] = processor(text=text, return_tensors="pt").input_ids[0]
         
-        # Audio
-        y = np.array(audio["array"])
+        # Audio → labels alinhados ao SpeechT5FeatureExtractor (HF)
+        y = np.asarray(audio["array"], dtype=np.float32).reshape(-1)
         sr = 16000
-        
-        mel_spectrogram = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_fft=1024, hop_length=256, win_length=1024, n_mels=80, fmin=80, fmax=7600
-        )
-        
-        # Method 3: Clip and Log10
-        mel_spectrogram = np.clip(mel_spectrogram, a_min=1e-5, a_max=None)
-        log_mel_spectrogram = np.log10(mel_spectrogram).T # (Time, 80)
-        
-        batch["labels"] = torch.tensor(log_mel_spectrogram)
-        batch["speaker_embeddings"] = create_speaker_embedding(y)
+        batch["labels"] = waveform_to_speecht5_label_tensor(y, processor.feature_extractor, sr)
+        batch["speaker_embeddings"] = create_speaker_embedding(audio["array"])
         
         return batch
 

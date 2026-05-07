@@ -6,7 +6,7 @@ from pathlib import Path
 
 def update_readmes():
     base_dir = Path("e:/Desenvolvimento/Python/tcc/tts-finetunning-8gb-vram/output_cuda_16gb")
-    config_path = Path("e:/Desenvolvimento/Python/tcc/tts-finetunning-8gb-vram/config.yaml")
+    config_path = Path("e:/Desenvolvimento/Python/tcc/tts-finetunning-8gb-vram/config_train.yaml")
 
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)

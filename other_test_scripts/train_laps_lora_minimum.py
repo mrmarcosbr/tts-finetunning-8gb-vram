@@ -13,9 +13,16 @@ from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, Tr
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
 import numpy as np
-import librosa
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Union
+import sys
+
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+from speecht5_mel_utils import waveform_to_speecht5_label_tensor
+
 
 def main():
     print("🚀 Iniciando Preparação para Treino LoRA (Laps Benchmark)...")
@@ -114,38 +121,10 @@ def main():
         # Process text -> input_ids
         batch["input_ids"] = processor(text=batch["text"], return_tensors="pt").input_ids[0]
         
-        # Process audio -> log-mel spectrogram (labels)
-        # Manual extraction using librosa since default feature_extractor failed (returned raw audio)
-        # SpeechT5 defaults: 80 mels. Using standard hop/win for now.
-        # Note: SpeechT5 pre-trained on Log-Mel.
-        
-        y = audio["array"]
+        # Labels = log-mel do SpeechT5FeatureExtractor (alinhado ao pré-treino / vocoder SpeechT5)
+        y = np.asarray(audio["array"], dtype=np.float32).reshape(-1)
         sr = 16000
-        
-        # Calculate Mel Spectrogram
-        # Using standard TTS params: n_fft=1024, hop_length=256, win_length=1024
-        # Note: If the model is sensitive to these, we might need adjustments.
-        mel_spectrogram = librosa.feature.melspectrogram(
-            y=y, 
-            sr=sr, 
-            n_fft=1024, 
-            hop_length=256, 
-            win_length=1024, 
-            n_mels=80,
-            fmin=80,
-            fmax=7600
-        )
-        
-        # Convert to log scale (db)
-        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
-        
-        # Normalize? SpeechT5 expects normalized? Usually yes.
-        # Let's standardize approx to [-4, 4] or similar if needed.
-        # But simple log mel is often enough for LoRA to adapt.
-        # We need Transpose: (Freq, Time) -> (Time, Freq)
-        log_mel_spectrogram = log_mel_spectrogram.T
-        
-        batch["labels"] = torch.tensor(log_mel_spectrogram)
+        batch["labels"] = waveform_to_speecht5_label_tensor(y, processor.feature_extractor, sr)
         
         # Debug Shape
         # print(f"DEBUG: labels shape in prep: {batch['labels'].shape}") 

@@ -1,7 +1,7 @@
 # CONFIGURAÇÕES GERAIS
 # ==============================================================================
 settings:
-  default_dataset_profile: "lapsbm_speecht5"
+  default_dataset_profile: "lapsbm_fastspeech2"
   local_datasets_dir: "./datasets"
 
 # ==============================================================================
@@ -47,6 +47,19 @@ hardware_profiles:
     gradient_checkpointing: false
     output_dir: "./output_cuda_16gb"
 
+  # FastSpeech2/Glow-TTS — multi-frase + ForwardTTS pica VRAM no micro-batch alto (cuda_16gb = 16×8).
+  # Mantém lote efetivo 128 (= 8×16); menos tensores simultâneos por passo de optimizador.
+  # gradient_checkpointing: pode poupar VRAM ao custo do tempo — se falhar com Coqui+PEFT, volta a false.
+  # Uso: python train_exhaustive.py --dataset lapsbm_fastspeech2 --profile cuda_16gb_fs2
+  cuda_16gb_fs2:
+    device: "cuda"
+    batch_size: 128
+    gradient_accumulation_steps: 2
+    bf16: true
+    fp16: false
+    gradient_checkpointing: true
+    output_dir: "./output_cuda_16gb_fs2"
+
   macbook:
     device: "mps" # Metal Performance Shaders para Apple Silicon
     batch_size: 2
@@ -76,13 +89,13 @@ models:
     model_type: "fastspeech2"
     sampling_rate: 22050
     # 0 = sem gradiente no ramo de pitch. ~0,08–0,12 = bom equilíbrio F0 vs resto; >0,15 pode instabilizar cedo.
-    pitch_loss_alpha: 0.1
+    pitch_loss_alpha: 0.15
     # F0: o checkpoint LJS (config.json) não traz pitch_mean/pitch_std; o pré-treino usou z-score de corpus (F0Dataset).
     # "zscore" = mean/std do teu f0_stats (padrão). "raw_hz" = experimental (diverge do LJS se não ajustar).
     f0_input_mode: "zscore"
     lora:
-      r: 64
-      alpha: 128
+      r: 128
+      alpha: 256
       dropout: 0.05
       # --- MAPA DE MÓDULOS PARA O LORA ---
       # Encoder (Cérebro Fonético)
@@ -182,8 +195,8 @@ dataset_profiles:
       logging_steps: 50
       save_total_limit: 0
       eval_steps: null
-      dataloader_num_workers: 4
-      dataloader_prefetch_factor: 2
+      dataloader_num_workers: 16
+      dataloader_prefetch_factor: 8
       fp16: null
       bf16: null
       load_best_model_at_end: true
@@ -198,7 +211,7 @@ dataset_profiles:
       #   append — mantém as n linhas como single e acrescenta round(n * append_multi_ratio) linhas multi
       #     (ex.: ratio 1.0 ⇒ n+n; 0.5 ⇒ n + n/2). Embaralhamento final (seed+100003 se seed definido).
       speecht5_train_spk_pool_mix_mode: append
-      speecht5_train_spk_pool_append_multi_ratio: 0.4
+      speecht5_train_spk_pool_append_multi_ratio: 0.5
       # --- REPLACE: fração multi por linha (~30% multi + ~70% single quando 0.3). Ignorado em append.
       # speecht5_train_spk_pool_multi_fraction: 0.5 ≈ 50% amostras multi (concat/mean conforme modo) + 50% single tradicional.
       # 1.0 = 100% multi (comportamento antigo). 0 = nunca funde (treino só single, apesar de K>1 na config).
@@ -209,43 +222,54 @@ dataset_profiles:
       speecht5_train_spk_pool_seed: null    # int opcional; null = índices extra determinísticos
       # Sugestões para segunda fase a partir de checkpoint forte (passo inicial): learning_rate mais baixo (ex. 3e-6), max_steps curto (+1500–3000).
 
+  # Preferência VRAM mais folgada que cuda_16gb direto (micro-batch alto): `--profile cuda_16gb_fs2`.
   # GPU 8GB: use --profile cuda_8gb (sobrescreve batch/grad do hardware). O default abaixo mira 12–16GB.
+  # Espelho fino do lapsbm_speecht5 para corrida comparável (mesmo split/LapsBM, mesmo teto de amostras, ~16k passos).
+  # Multi-frase (mesmo locutor, áudio+fala fundidos): `training.fastspeech2_train_spk_pool_*` como no SpeechT5; só `concat` (mean não existe no FS2).
+  # NR em treino = mesmo CLI `--noise_reduce` que no SpeechT5.
   lapsbm_fastspeech2:
     dataset_id: "falabrasil/lapsbm"
     dataset_split: "test"
     model_type: "fastspeech2"
     num_speakers: 0
-    num_samples_per_speaker: 2000
+    num_samples_per_speaker: 10000
     zero_shot_split:
       train_speakers: 28
       val_speakers: 3
       test_speakers: 4
     training:
-      # Run 10k passos do zero: max_steps tem prioridade sobre num_epochs no HuggingFace Trainer.
-      max_steps: 10000
-      learning_rate: 0.00004 # ligeiramente mais suave com pitch_loss_alpha 0.1 (reduz picos no MAS/F0)
-      # 32x4=128: menos passos de grad accumulation que 16x8 (acelera o step). Reduzir batch se OOM.
+      # max_steps tem prioridade sobre num_epochs no Trainer (alinhar ao SpeechT5 ~16k).
+      max_steps: 16000
+      learning_rate: 0.00002
+      weight_decay: 0.01
+      # Com `--profile cuda_16gb` ou `cuda_16gb_fs2`: batch/grad_acc vêm do hardware (ignora 32×4 abaixo).
+      # cuda_16gb_fs2 = 8×16, VRAM mais folgada para multi-frase FS2.
       batch_size: 32
       gradient_accumulation_steps: 4
-      # No Windows, muitos workers + spawn piora; 4 costuma bater com 8. +workers não acelera se CPU for gargalo.
       dataloader_num_workers: 4
-      num_epochs: 2500
-      save_steps: 1000
-      # null/omit/0: conservar todos os checkpoint-*; inteiro N>0: manter só os N mais recentes
-      # save_total_limit: 3
-      logging_steps: 100
-      # null = a cada save_steps; inteiro = override
+      num_epochs: 4000
+      save_steps: 100
+      logging_steps: 50
+      save_total_limit: 0
       eval_steps: null
-      # 0 = desligado. Sofretensão: ~1500–3000 dá tempo ao MAS/align antes do binário a 1.0, ajudando o ramo de pitch a não brigar
-      binary_align_warmup_steps: 2000
-      # warmup de LR; depois coseno (longos runs)
+      load_best_model_at_end: true
+      metric_for_best_model: "eval_loss"
+      greater_is_better: false
+      # Escala ~ linear com max_steps (antes 2k @ 10k passos); ajuda MAS/pitch antes do alinhador binário pleno.
+      binary_align_warmup_steps: 3200
       warmup_ratio: 0.05
       lr_scheduler_type: "cosine"
-      # null = herdar fp16/bf16 do hardware_profiles; true/false força (ex.: desligar bf16 noutra GPU)
       fp16: null
       bf16: null
-      # prefetch por worker (1–4); 2 = default razoável
       dataloader_prefetch_factor: 2
+      # --- Opcional: multi-frase (igual filosofia SpeechT5; concat = mel+F0 no waveform fundido)
+      fastspeech2_train_spk_pool_mix_mode: append
+      fastspeech2_train_spk_pool_append_multi_ratio: 0.4
+      fastspeech2_train_spk_pool_multi_fraction: 0.3
+      fastspeech2_train_spk_pool_size: 2
+      fastspeech2_train_spk_pool_mode: concat
+      fastspeech2_train_spk_pool_gap_sec: 0.25
+      fastspeech2_train_spk_pool_seed: null
 
   lapsbm_matcha:
     dataset_id: "falabrasil/lapsbm"
@@ -263,6 +287,7 @@ dataset_profiles:
     dataset_split: "test"
     model_type: "glow_tts"
     num_speakers: 0
+    # Multi-frase no treino (opcional): mesmas chaves `fastspeech2_train_spk_pool_*` que em lapsbm_fastspeech2.
     training:
       learning_rate: 0.00005
       num_epochs: 2500

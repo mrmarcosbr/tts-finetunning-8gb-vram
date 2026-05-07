@@ -26,6 +26,7 @@ from datasets import load_dataset, Audio, Dataset
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments, SpeechT5HifiGan
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from speechbrain.inference.speaker import EncoderClassifier
+from speecht5_mel_utils import waveform_to_speecht5_label_tensor
 
 # Garante que a saída do terminal no Windows suporte caracteres especiais (UTF-8)
 if sys.stdout.encoding.lower() != 'utf-8':
@@ -62,7 +63,7 @@ def extract_speaker_id(item):
                 
     return "unknown" # Retorna 'unknown' se não conseguir identificar o locutor
 
-def load_config(config_path="config.yaml"):
+def load_config(config_path="config_train.yaml"):
     """Lê o arquivo de configuração YAML que contém perfis de hardware e datasets."""
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
@@ -143,12 +144,10 @@ class SpeechT5Handler(ModelHandler):
         
         # Transforma texto em tokens (IDs numéricos)
         batch["input_ids"] = processor(text=clean_text, return_tensors="pt").input_ids[0]
-        y = np.array(audio["array"]) # Converte áudio bruto em array numpy
-        
-        # SpeechT5 treina tentando prever o Mel-Spectrogram (uma representação visual do som)
-        mel = librosa.feature.melspectrogram(y=y, sr=16000, n_fft=1024, hop_length=256, n_mels=80, fmin=80, fmax=7600)
-        log_mel = np.log10(np.clip(mel, 1e-5, None)).T # Transforma para escala logarítmica
-        batch["labels"] = torch.tensor(log_mel)
+        # Log-mel alinhado ao SpeechT5FeatureExtractor (HF): amplitude mel + Slaney + log10
+        y = np.asarray(audio["array"], dtype=np.float32).reshape(-1)
+        fe = processor.feature_extractor
+        batch["labels"] = waveform_to_speecht5_label_tensor(y, fe, sampling_rate=int(fe.sampling_rate))
         
         # Extrai o Speaker Embedding (a 'impressão digital' da voz) usando um modelo pré-treinado
         with torch.no_grad():
@@ -434,7 +433,7 @@ def main():
     parser = argparse.ArgumentParser(description="Treinamento TTS Generalizado con LoRA")
     parser.add_argument("--profile", type=str, default=None, help="Perfil de hardware (opcional)")
     parser.add_argument("--dataset", type=str, default=None, help="Perfil do dataset configurado no YAML")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Caminho do arquivo config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml", help="Caminho do arquivo config_train.yaml")
     args = parser.parse_args()
 
     # Carrega o arquivo de configuração YAML

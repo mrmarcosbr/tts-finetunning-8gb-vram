@@ -3,12 +3,12 @@ Avaliação em pasta metrics_aval: WER (via ASR) e F0 RMSE (YIN + alinhamento te
 
 Convénio de ficheiros (igual a f0_infer_metrics.py):
   {prefix}_referencia.wav — gravação de referência (dataset / locutor)
-  {prefix}_original.wav   — síntese modelo base
-  {prefix}_treinado.wav   — síntese após fine-tuning
+  {prefix}_base.wav      — síntese modelo base SpeechT5 (sem LoRA; legado: *_original.wav)
+  {prefix}_treinado.wav  — síntese após fine-tuning
 
 WER:
-  Whisper transcreve *_original.wav e *_treinado.wav. O texto de referência (WER) pode ser:
-    • {prefix}.txt — ex.: sentenca_1.txt (comum a sentenca_1_original/referencia/treinado.wav)
+  Whisper transcreve *_base.wav e *_treinado.wav. O texto de referência (WER) pode ser:
+    • {prefix}.txt — ex.: sentenca_1.txt (comum a sentenca_1_base/referencia/treinado.wav)
     • {prefix}_referencia.txt — ex.: sentenca_1_referencia.txt (alinhado ao nome do WAV de referência)
   Ou TSV/JSON em lote (ver load_reference_map).
 
@@ -50,6 +50,7 @@ from f0_infer_metrics import (
     DEFAULT_SR,
     _INFERENCE_PAIR_EXTS,
     compute_metrics_for_inference_dir,
+    inference_pair_prefix_sort_key,
     iter_inference_audio_triplets,
 )
 from trained_post_eq import apply_trained_output_waveform_eq, trained_eq_affects_audio
@@ -87,6 +88,29 @@ def word_error_rate(reference_text: str, hypothesis_text: str) -> float:
             else:
                 d[i][j] = min(d[i - 1][j - 1], d[i][j - 1], d[i - 1][j]) + 1
     return float(d[len(ref_words)][len(hyp_words)]) / len(ref_words)
+
+
+def char_error_rate(reference_text: str, hypothesis_text: str) -> float:
+    """CER (taxa de caracteres errados) em string normalizada, sem espaços."""
+    r = re.sub(r"\s+", "", wer_prepare(reference_text))
+    h = re.sub(r"\s+", "", wer_prepare(hypothesis_text))
+    if not r:
+        return 0.0
+    ch_r = list(r)
+    ch_h = list(h)
+    n, m = len(ch_r), len(ch_h)
+    d = np.zeros((n + 1, m + 1), dtype=np.uint32)
+    for i in range(n + 1):
+        d[i][0] = i
+    for j in range(m + 1):
+        d[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ch_r[i - 1] == ch_h[j - 1]:
+                d[i][j] = d[i - 1][j - 1]
+            else:
+                d[i][j] = min(d[i - 1][j - 1], d[i][j - 1], d[i - 1][j]) + 1
+    return float(d[n][m]) / len(ch_r)
 
 
 def load_reference_map(metrics_dir: Path, explicit_path: Optional[str]) -> Dict[str, str]:
@@ -154,7 +178,7 @@ def load_reference_map(metrics_dir: Path, explicit_path: Optional[str]) -> Dict[
     # Por-utterance .txt (ex.: sentenca_1.txt ou sentenca_1_referencia.txt)
     prefixes = set()
     for ext in _INFERENCE_PAIR_EXTS:
-        for tail in (f"_original{ext}", f"_treinado{ext}", f"_referencia{ext}"):
+        for tail in (f"_base{ext}", f"_original{ext}", f"_treinado{ext}", f"_referencia{ext}"):
             for aud in metrics_dir.glob(f"*{tail}"):
                 if not aud.is_file() or not aud.name.lower().endswith(tail.lower()):
                     continue
@@ -165,7 +189,7 @@ def load_reference_map(metrics_dir: Path, explicit_path: Optional[str]) -> Dict[
         if m:
             refs[m.group(1)] = p.read_text(encoding="utf-8").strip()
 
-    for pref in sorted(prefixes):
+    for pref in sorted(prefixes, key=inference_pair_prefix_sort_key):
         if pref in refs:
             continue
         tp = metrics_dir / f"{pref}.txt"
@@ -175,54 +199,55 @@ def load_reference_map(metrics_dir: Path, explicit_path: Optional[str]) -> Dict[
     return refs
 
 
-_asr_pipe = None
+# Whisper via generate() + processor: evita o pipeline ASR recente que em Windows pode exigir TorchCodec.
+_whisper_bundle: Optional[Tuple[Any, Any, str]] = None
 
 
-def get_asr_pipeline(
-    model_id: str,
-    device: str,
-    torch_dtype: Optional[Any] = None,
-):
-    global _asr_pipe
-    if _asr_pipe is not None:
-        return _asr_pipe
+def _whisper_model_and_processor(model_id: str, device: str) -> Tuple[Any, Any]:
+    global _whisper_bundle
+    key = f"{model_id}|{device}"
+    if _whisper_bundle is not None and _whisper_bundle[2] == key:
+        return _whisper_bundle[0], _whisper_bundle[1]
+
     import torch
-    from transformers import pipeline
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    if torch_dtype is None:
-        torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    processor = WhisperProcessor.from_pretrained(model_id)
+    model = WhisperForConditionalGeneration.from_pretrained(model_id)
+    model.eval()
 
-    dev: Union[int, str]
+    dev_torch: Union[int, str]
     if device == "cpu" or device == "-1":
-        dev = -1
+        dev_torch = "cpu"
     elif device == "cuda" or device.startswith("cuda:"):
-        try:
-            dev = int(device.split(":")[1]) if ":" in device else 0
-        except (IndexError, ValueError):
-            dev = 0
+        if not torch.cuda.is_available():
+            dev_torch = "cpu"
+        elif ":" in device:
+            dev_torch = device
+        else:
+            dev_torch = "cuda"
     else:
         try:
-            dev = int(device)
+            dev_torch = int(device)
         except ValueError:
-            dev = device
+            dev_torch = device
 
-    try:
-        _asr_pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            torch_dtype=torch_dtype,
-            device=dev,
-            chunk_length_s=30,
-        )
-    except TypeError:
-        _asr_pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            dtype=torch_dtype,
-            device=dev,
-            chunk_length_s=30,
-        )
-    return _asr_pipe
+    model = model.to(dev_torch)
+    _whisper_bundle = (processor, model, key)
+    return processor, model
+
+
+def _whisper_forced_decoder_ids(processor: Any, language: Optional[str]) -> Optional[Any]:
+    if not language:
+        return None
+    fn = getattr(processor, "get_decoder_prompt_ids", None)
+    if callable(fn):
+        return fn(language=language, task="transcribe")
+    tok = getattr(processor, "tokenizer", None)
+    fn2 = getattr(tok, "get_decoder_prompt_ids", None) if tok is not None else None
+    if callable(fn2):
+        return fn2(language=language, task="transcribe")
+    return None
 
 
 def transcribe_wav(
@@ -232,19 +257,22 @@ def transcribe_wav(
     model_id: str,
     device: str,
 ) -> str:
-    pipe = get_asr_pipeline(model_id, device)
-    kw: Dict[str, Any] = {}
-    if language:
-        kw["language"] = language
-        kw["task"] = "transcribe"
-    # Caminho ou array; o pipeline reamostra para a taxa do modelo
-    if kw:
-        out = pipe(str(wav_path), generate_kwargs=kw)
-    else:
-        out = pipe(str(wav_path))
-    if isinstance(out, dict):
-        return str(out.get("text", "")).strip()
-    return str(out).strip()
+    import torch
+
+    processor, model = _whisper_model_and_processor(model_id, device)
+    y, _sr = librosa.load(str(wav_path), sr=16000, mono=True)
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    inputs = processor(y, sampling_rate=16000, return_tensors="pt")
+    input_features = inputs.input_features.to(model.device, dtype=model.dtype)
+    forced = _whisper_forced_decoder_ids(processor, language)
+    # Whisper large: contexto ~448; forced_decoder_ids consome alguns tokens — não usar 448 «cheios».
+    gen_kw: Dict[str, Any] = {"max_new_tokens": 440}
+    if forced is not None:
+        gen_kw["forced_decoder_ids"] = forced
+    with torch.no_grad():
+        ids = model.generate(input_features, **gen_kw)
+    text = processor.batch_decode(ids, skip_special_tokens=True)[0]
+    return str(text).strip()
 
 
 def iter_triplets(metrics_dir: Path) -> Iterable[Tuple[str, Path, Path, Optional[Path]]]:
@@ -332,24 +360,22 @@ def print_terminal_per_audio_report(
         p = str(r.get("pair_prefix", ""))
         line: List[str] = [p]
         if include_wer:
-            wo = _parse_float_metric(r.get("wer_original"))
+            wo = _parse_float_metric(r.get("wer_base"))
             wt = _parse_float_metric(r.get("wer_treinado"))
             line.append(f"{100.0 * wo:.1f}%" if wo is not None else "—")
             line.append(f"{100.0 * wt:.1f}%" if wt is not None else "—")
         if include_f0:
-            fb = _parse_float_metric(r.get("f0_rmse_hz_vs_base"))
-            fo = _parse_float_metric(r.get("f0_rmse_hz_original_vs_ref"))
-            ft = _parse_float_metric(r.get("f0_rmse_hz_treinado_vs_ref"))
-            line.append(f"{fb:.2f}" if fb is not None else "—")
+            fo = _parse_float_metric(r.get("f0_rmse_base"))
+            ft = _parse_float_metric(r.get("f0_rmse_treinado"))
             line.append(f"{fo:.2f}" if fo is not None else "—")
             line.append(f"{ft:.2f}" if ft is not None else "—")
         body.append(line)
 
     headers: List[str] = ["prefix"]
     if include_wer:
-        headers.extend(["WER_orig", "WER_treinado"])
+        headers.extend(["WER_base", "WER_treinado"])
     if include_f0:
-        headers.extend(["F0_tr↔base", "F0_orig↔ref", "F0_tr↔ref"])
+        headers.extend(["F0_base↔ref", "F0_tr↔ref"])
 
     widths = [
         max(len(headers[i]), max((len(row[i]) for row in body), default=0))
@@ -362,8 +388,7 @@ def print_terminal_per_audio_report(
         print("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
     if include_f0:
         print(
-            "Nota: F0_tr↔base = treinado vs original sintético | "
-            "F0_orig↔ref / F0_tr↔ref = vs áudio de referência (se existir)."
+            "Nota: F0_base↔ref / F0_tr↔ref = RMSE(Hz) entre contour do sintético e do WAV de referência."
         )
 
 
@@ -371,20 +396,16 @@ def _round_metric_value_for_csv(key: str, v: Any) -> Any:
     x = _parse_float_metric(v)
     if x is None:
         return v
-    if key in ("wer_original", "wer_treinado"):
+    if key in ("wer_base", "wer_treinado"):
         return f"{x:.2f}"
-    if key in (
-        "f0_rmse_hz_vs_base",
-        "f0_rmse_hz_original_vs_ref",
-        "f0_rmse_hz_treinado_vs_ref",
-    ):
+    if key in ("f0_rmse_base", "f0_rmse_treinado"):
         return f"{x:.2f}"
     return v
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="WER + F0 RMSE sobre metrics_aval (tripletos *_referencia/original/treinado)."
+        description="WER + F0 RMSE sobre metrics_aval (tripletos *_referencia/base ou original/treinado)."
     )
     parser.add_argument(
         "--dir",
@@ -505,7 +526,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     triplets_raw = list(iter_triplets(metrics_dir))
     if not triplets_raw:
         print(
-            f"[erro] Nenhum par *_original + *_treinado em {metrics_dir} (.wav/.mp3/…; extensões podem misturar).",
+            f"[erro] Nenhum par *_base/_original + *_treinado em {metrics_dir} (.wav/.mp3/…; extensões podem misturar).",
             file=sys.stderr,
         )
         return 1
@@ -600,7 +621,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         )
                         wo = word_error_rate(ref_text_for_wer, hyp_o)
                         wt = word_error_rate(ref_text_for_wer, hyp_t)
-                        row["wer_original"] = wo
+                        row["wer_base"] = wo
                         row["wer_treinado"] = wt
                         row["asr_original"] = hyp_o
                         row["asr_treinado"] = hyp_t
@@ -639,19 +660,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 fieldnames.append(k)
     pref = [
         "pair_prefix",
-        "wer_original",
+        "wer_base",
         "wer_treinado",
-        "f0_rmse_hz_vs_base",
-        "f0_rmse_hz_original_vs_ref",
-        "f0_rmse_hz_treinado_vs_ref",
+        "cer_base",
+        "cer_treinado",
+        "f0_rmse_base",
+        "f0_rmse_treinado",
     ]
     ordered = [k for k in pref if k in fieldnames] + [k for k in fieldnames if k not in pref]
     _csv_metric_keys = (
-        "wer_original",
+        "wer_base",
         "wer_treinado",
-        "f0_rmse_hz_vs_base",
-        "f0_rmse_hz_original_vs_ref",
-        "f0_rmse_hz_treinado_vs_ref",
+        "cer_base",
+        "cer_treinado",
+        "f0_rmse_base",
+        "f0_rmse_treinado",
     )
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=ordered, extrasaction="ignore")
@@ -676,9 +699,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n--- Médias ---")
     if not args.skip_wer and (no > 0 or nt > 0):
         print(
-            f"  WER médio (original):   {100.0 * mo:.2f}%  (n={no})"
+            f"  WER médio (base):   {100.0 * mo:.2f}%  (n={no})"
             if np.isfinite(mo)
-            else "  WER médio (original):   (sem valores)"
+            else "  WER médio (base):   (sem valores)"
         )
         print(
             f"  WER médio (treinado):   {100.0 * mt:.2f}%  (n={nt})"
@@ -686,19 +709,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             else "  WER médio (treinado):   (sem valores)"
         )
     if not args.skip_f0:
-        from f0_infer_metrics import summarize_f0_metrics_rows, summarize_f0_metrics_vs_reference
+        from f0_infer_metrics import summarize_f0_rmse_inference
 
-        hz_b, v_b, _ = summarize_f0_metrics_rows(f0_rows)
-        mo_f0, ko, mt_f0, kt = summarize_f0_metrics_vs_reference(f0_rows)
-        if np.isfinite(hz_b):
-            print(
-                f"  F0 RMSE médio treinado vs base:    {hz_b:.2f} Hz (válidos={v_b}) "
-                "(LoRA vs síntese sem LoRA; mesmo texto)"
-            )
+        mo_f0, ko, mt_f0, kt = summarize_f0_rmse_inference(f0_rows)
         if ko > 0 and np.isfinite(mo_f0):
             print(
                 f"  F0 RMSE médio base vs ref:         {mo_f0:.2f} Hz (n={ko}) "
-                "(*_original.wav = síntese sem LoRA vs gravação)"
+                "(*_base.wav / legado *_original.wav = síntese sem LoRA vs gravação)"
             )
         if kt > 0 and np.isfinite(mt_f0):
             print(

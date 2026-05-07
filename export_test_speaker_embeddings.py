@@ -9,7 +9,7 @@ Saída:
     `.wav`, `.txt` e `spk_<id>_idx<dataset_index>_emb.npy` (embedding só se o clip for válido).
 
 Exemplo:
-  python export_test_speaker_embeddings.py --config config.yaml --dataset lapsbm_speecht5 --device cuda
+  python export_test_speaker_embeddings.py --config config_train.yaml --dataset lapsbm_speecht5 --device cuda
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ def aggregate_embeddings(vectors: List[np.ndarray], mode: str) -> np.ndarray:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="x-vectors dos locutores do split teste (zero-shot).")
-    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml")
     parser.add_argument("--dataset", type=str, default="lapsbm_speecht5")
     parser.add_argument(
         "--output_dir",

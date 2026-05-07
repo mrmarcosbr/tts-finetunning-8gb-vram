@@ -524,7 +524,7 @@ def export_test_base(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reconstrói e exporta a base de teste por locutor.")
-    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml")
     parser.add_argument("--dataset_profile", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./datasets/test_split_inferencia/lapsbm_speecht5")
     parser.add_argument("--cache_dir", type=str, default="./datasets/cache_processado/speecht5_lapsbm_speecht5_16000hz")

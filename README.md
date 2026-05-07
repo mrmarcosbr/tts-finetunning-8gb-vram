@@ -1,10 +1,10 @@
-.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml 
+.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml 
 
-.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --resume_from ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-30-20-14-15\checkpoint-4900" 
+.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --resume_from ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-30-20-14-15\checkpoint-4900" 
 
-python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-05-01-00-37-27\checkpoint-9900" --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --compute_f0_rmse --dataset_reference_audios --infer_all_test_sentences
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-05-01-00-37-27\checkpoint-9900" --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --compute_f0_rmse --dataset_reference_audios --infer_all_test_sentences
 
-python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-27-02-20-47\checkpoint-9500" --profile cuda_16gb --dataset lapsbm_speecht5 --config config.yaml --dataset_reference_audios --infer_all_test_sentences --speecht5_zero_speaker_embedding
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-27-02-20-47\checkpoint-9500" --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --dataset_reference_audios --infer_all_test_sentences --speecht5_zero_speaker_embedding
 
 
 # tts-finetunning-8gb-vram
@@ -43,8 +43,9 @@ Para clonar e preservar os arquivos de áudio originais (ex: LapsBM, Pt-BR Char)
 Isso formará a pasta `/meus_datasets/`. Sempre que você rodar os testes de Inferência ou Treinamento a partir de agora, eles utilizarão primariamente e prioritariamente a leitura nativa isolada nos seus discos rígidos onde a internet se torna irrelevante.
 
 # Configuração do Treinamento/Fine-Tuning
-Verificar o arquivo config.yaml que contem as configurações de treinamento para cada profile (ex: "cuda_16gb", "macbook", "cpu").
-- config.yaml
+Verificar o arquivo `config_train.yaml`, que contém as configurações de treinamento para cada profile (ex: "cuda_16gb", "macbook", "cpu").
+- `config_train.yaml`
+- `config_inference.yaml`: defaults opcionais para `test_inference_exhaustive.py` (carregado automaticamente se existir; ver `--inference_config`).
 
 # Treina Modelo (Fine Tunning)
 Usando Detecção Automática de Hardware: 

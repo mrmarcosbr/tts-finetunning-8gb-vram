@@ -1,5 +1,18 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 
+# ----------------------------------------------------------------------------
+# Dependências por padrão: SpeechT5 (fine-tuning com LoRA, inferência HF 5.x).
+# Cobre train_exhaustive.py, test_inference_exhaustive.py, speecht5_mel_utils, datasets HF, SpeechBrain x-vector.
+#
+# Instalação típica (Windows):
+#   python -m venv .venv
+#   .\.venv\Scripts\activate
+#   python -m pip install -U pip
+#   pip install -r requirements.txt
+#
+# Opcional FastSpeech2 / Coqui: ver requirements_fs2.txt (overlay ou venv aparte).
+# ----------------------------------------------------------------------------
+
 accelerate==1.13.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
@@ -39,6 +52,7 @@ msgpack==1.1.2
 multidict==6.7.1
 multiprocess==0.70.16
 networkx==3.6.1
+noisereduce==3.0.3
 numba==0.64.0
 numpy==2.4.4
 packaging==26.0
@@ -53,6 +67,7 @@ pyarrow-hotfix==0.7
 pycparser==3.0
 Pygments==2.19.2
 python-dateutil==2.9.0.post0
+python-dotenv>=1.0.0
 PyYAML==6.0.3
 regex>=2024.0.0
 requests==2.33.0

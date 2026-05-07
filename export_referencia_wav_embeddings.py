@@ -3,7 +3,7 @@
 Exporta um x-vector SpeechBrain (512-D, L2-normalizado) por ficheiro `*_referencia.wav`
 numa pasta de batch de inferência.
 
-Usa o mesmo `speaker_encoder_id` e `sampling_rate` que o perfil SpeechT5 no `config.yaml`.
+Usa o mesmo `speaker_encoder_id` e `sampling_rate` que o perfil SpeechT5 no `config_train.yaml`.
 
 Exemplo:
   python export_referencia_wav_embeddings.py \\
@@ -57,7 +57,7 @@ def main() -> int:
         required=True,
         help="Pasta com ficheiros *_referencia.wav",
     )
-    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--config", type=str, default="config_train.yaml")
     parser.add_argument(
         "--dataset",
         type=str,
