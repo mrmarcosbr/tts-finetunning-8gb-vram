@@ -1,0 +1,78 @@
+# CONFIGURAÇÕES GERAIS
+# ==============================================================================
+settings:
+  default_profile: "lapsbm_speecht5"
+  local_datasets_dir: "./datasets"
+  # Compatibilidade com CLI antiga (--profile cuda_16gb / --dataset lapsbm_speecht5)
+  profile_aliases:
+    cuda_16gb: lapsbm_speecht5
+    default: lapsbm_speecht5
+
+# ==============================================================================
+# PERFIL UNIFICADO (hardware + modelo + dataset + treino)
+# Conteúdo mesclado de: cuda_16gb + speecht5 + lapsbm_speecht5
+# Uso: python train_exhaustive.py
+#      python train_exhaustive.py --profile lapsbm_speecht5
+# ==============================================================================
+profiles:
+  lapsbm_speecht5:
+    # --- hardware (ex-cuda_16gb) ---
+    device: "cuda"
+    batch_size: 16
+    gradient_accumulation_steps: 8
+    bf16: true
+    fp16: false
+    gradient_checkpointing: false
+    output_dir: "./output_cuda_16gb"
+
+    # --- modelo (ex-speecht5) ---
+    model_type: "speecht5"
+    id: "microsoft/speecht5_tts"
+    sampling_rate: 16000
+    vocoder_id: "microsoft/speecht5_hifigan"
+    speaker_encoder_id: "speechbrain/spkrec-xvect-voxceleb"
+    lora:
+      r: 64
+      alpha: 128
+      dropout: 0.05
+      target_modules: [ "q_proj", "k_proj", "v_proj", "out_proj" ]
+
+    # --- dataset (ex-lapsbm_speecht5) ---
+    dataset_id: "falabrasil/lapsbm"
+    dataset_split: "test"
+    num_speakers: 0
+    num_samples_per_speaker: 10000
+    zero_shot_split:
+      train_speakers: 28
+      val_speakers: 3
+      test_speakers: 4
+    # model_overrides:
+    #   lora:
+    #     r: 128
+
+    # --- treino ---
+    training:
+      learning_rate: 0.00001
+      num_epochs: 4000
+      max_steps: 16000
+      weight_decay: 0.01
+      warmup_ratio: 0.05
+      lr_scheduler_type: "cosine"
+      save_steps: 100
+      logging_steps: 50
+      save_total_limit: 0
+      eval_steps: null
+      dataloader_num_workers: 16
+      dataloader_prefetch_factor: 8
+      fp16: null
+      bf16: null
+      load_best_model_at_end: true
+      metric_for_best_model: "eval_loss"
+      greater_is_better: false
+      speecht5_train_spk_pool_mix_mode: append
+      speecht5_train_spk_pool_append_multi_ratio: 0.2
+      speecht5_train_spk_pool_multi_fraction: 0.2
+      speecht5_train_spk_pool_size: 2
+      speecht5_train_spk_pool_mode: concat
+      speecht5_train_spk_pool_gap_sec: 0.25
+      speecht5_train_spk_pool_seed: null

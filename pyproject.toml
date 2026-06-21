@@ -95,3 +95,6 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

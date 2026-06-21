@@ -7,7 +7,7 @@
 # Grava o log em UTF-8 (com BOM) para emojis/acentos nao corromperem. Tee-Object em Windows
 # usa o encoding do sistema e mexe UTF-8 do Python.
 #
-# Saída: terminal + ficheiro out-<yyyyMMdd-HHmmss>.txt no diretório atual
+# Saída: terminal + ficheiro logs/out-<yyyyMMdd-HHmmss>.txt (cria logs/ se não existir)
 
 param(
     [Parameter(Mandatory = $false, ValueFromRemainingArguments = $true)]
@@ -19,7 +19,9 @@ try { chcp 65001 | Out-Null } catch { }  # UTF-8 na consola (cmd antigo)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $ts = Get-Date -Format "yyyyMMdd-HHmmss"
-$logFile = Join-Path (Get-Location) "out-$ts.txt"
+$logsDir = Join-Path $PSScriptRoot "logs"
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+$logFile = Join-Path $logsDir "out-$ts.txt"
 
 $py = $null
 if ($env:VIRTUAL_ENV) {

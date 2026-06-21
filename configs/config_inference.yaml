@@ -1,0 +1,77 @@
+# Defaults para test_inference_exhaustive.py (config_inference.yaml)
+# Coloque ao lado do script ou passe: --inference_config caminho/config_inference.yaml
+# CLI continua sobrescrevendo qualquer chave aqui.
+#
+# Valores "desligado": flags false, high-pass 0 dB, treble_boost 0, apenas métricas opcionais sem só-dir, etc.
+
+# --- Pedido explícito (seu run de referência) ---
+#model_path: "./output_cuda_16gb/speecht5-lapsbm_speecht5-2026-05-01-00-37-27/checkpoint-9900"
+model_path: "./output_cuda_16gb/speecht5-lapsbm_speecht5-2026-06-20-00-26-33/checkpoint-9100"
+profile: lapsbm_speecht5
+config: configs/config_train.yaml
+compute_wer_cer: true
+compute_f0_rmse: true
+dataset_reference_audios: true
+infer_all_test_sentences: true
+
+# --- Texto / lotes ---
+text: null
+length_scale: null
+test_text_seed: null
+
+# --- Pré/pós-processamento (desligado) ---
+apply_peak_normalization: true
+peak_normalization_db: 0.0
+apply_trained_bass_treatment: false
+trained_bass_cut_hz: 120.0
+trained_bass_atten_db: 1.2
+trained_bass_transition_hz: 120.0
+trained_grave_highpass_hz: 0.0
+trained_treble_shelf_hz: 3500.0
+trained_treble_transition_hz: 1000.0
+trained_treble_boost_db: 0.0
+apply_silence_cleanup: false
+silence_top_db: 35.0
+speecht5_inference_highpass_hz: 0.0
+
+# --- NR na inferência (desligado; *_nr não é gerado) ---
+noise_reduce: true
+noise_clip_sec: 1.0
+noise_prop_decrease: 0.93
+no_noise_peak_match: false
+
+# --- Métricas: só pasta WAV existente (desligado) ---
+only_f0_rmse_dir: null
+f0_sample_rate: 16000
+f0_hop_length: 256
+f0_fmin: 50.0
+f0_fmax: 500.0
+
+# --- ASR WER/CER ---
+wer_cer_whisper_model: openai/whisper-large-v3
+wer_cer_whisper_language: portuguese
+wer_cer_device: null
+
+# --- Subconjuntos de frases ---
+dataset_sentence_limit: 5
+dataset_train_reference_audios: false
+dataset_train_sentence_limit: 5
+
+# --- Export ---
+no_mp3: true
+mp3_bitrate: 192k
+
+# --- SpeechT5: apenas default_texts, 3 × condicionamentos (treino/teste/longest/ref log) ---
+default_texts_triple_speaker_embedding: false
+speecht5_zero_speaker_embedding: false
+use_test_embeddings: false
+use_test_embeddings_dir: "./embeddings_test_speakers"
+speecht5_speaker_emb_mix: 0.0
+speecht5_speaker_emb_mix_mode: toward_neutral
+speecht5_chunk_max_chars: 100
+speecht5_inter_chunk_silence_sec: 0.0
+speecht5_speaker_emb_pool_size: 1
+speecht5_speaker_emb_pool_mode: mean
+speecht5_speaker_emb_pool_concat_gap_sec: 0.25
+speecht5_speaker_emb_pool_include_train: false
+speecht5_speaker_emb_pool_seed: null

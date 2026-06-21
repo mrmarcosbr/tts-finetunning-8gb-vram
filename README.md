@@ -1,13 +1,21 @@
-.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml 
+.\run_with_log.ps1 train_exhaustive.py --config configs/config_train.yaml 
 
-.\run_with_log.ps1 train_exhaustive.py --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --resume_from ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-30-20-14-15\checkpoint-4900" 
+.\run_with_log.ps1 train_exhaustive.py --config configs/config_train.yaml --resume_from ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-30-20-14-15\checkpoint-4900" 
 
-python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-05-01-00-37-27\checkpoint-9900" --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --compute_f0_rmse --dataset_reference_audios --infer_all_test_sentences
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-05-01-00-37-27\checkpoint-9900" --config configs/config_train.yaml --compute_f0_rmse --dataset_reference_audios --infer_all_test_sentences
 
-python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-27-02-20-47\checkpoint-9500" --profile cuda_16gb --dataset lapsbm_speecht5 --config config_train.yaml --dataset_reference_audios --infer_all_test_sentences --speecht5_zero_speaker_embedding
+python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-lapsbm_speecht5-2026-04-27-02-20-47\checkpoint-9500" --config configs/config_train.yaml --dataset_reference_audios --infer_all_test_sentences --speecht5_zero_speaker_embedding
 
 
 # tts-finetunning-8gb-vram
+
+## Estrutura do repositório
+
+- **Ativo:** entry points na raiz → `src/tts/` (camadas clean) — ver [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Logs novos:** `logs/out-<timestamp>.txt` (via `run_with_log.ps1`)
+- **Dados locais:** `data/` — ver secção [Estrutura de dados](#estrutura-de-dados-data) abaixo
+- **Embeddings opcionais:** `embeddings_test_speakers/` — usado com `--use-test-embeddings` (pipeline ativo; não é legacy)
+- **Arquivo:** só material **sem** referência nos scripts/configs ativos — ver [`legacy/`](legacy/README.md)
 
 - Testado com python 3.11.9 (Windows) e 3.12.3 (Linux)
 - Drivers CUDA da NVIDA para rodar pytorch usando a GPU
@@ -31,28 +39,75 @@ python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\speecht5-la
  
 # Aplicar Patches e Correções Nativas 
 Algumas bibliotecas como SpeechBrain e HuggingFace podem apresentar erros e alertas conflitantes (ex: warnings do `autocast`, bugs de `HF_TOKEN` suprimido e erros falsos 404 HTTP). Para ter um ambiente de console limpo e livre de interrupções falsas, execute os scripts de correção que injetam os reparos diretamente na sua subpasta `venv_global` recém instalada (somente depois de já ter instalado os pacotes com `uv pip install`):
-- `python apply_patches_no_warnings.py`
+- `python scripts/setup/apply_patches_no_warnings.py`
+
+# Estrutura de dados (`data/`)
+
+Todo o material de datasets fica sob **`data/`** (configurável em `configs/config_train.yaml` → `settings`). Nada disto é versionado no Git.
+
+```
+data/
+├── raw/              # Espelho offline do Hugging Face (download_datasets.py)
+│   └── lapsbm/       #   Ficheiros brutos do repo HF (tar.gz, etc.)
+├── repository/       # Dataset para treino/inferência (formato save_to_disk)
+│   └── lapsbm/       #   Criado na 1.ª corrida ou ao gravar após streaming HF
+├── cache/            # Cache de pré-processamento (mel, NR, multi-frase)
+│   └── speecht5_lapsbm_speecht5_16000hz_.../
+└── exports/          # Exportações auxiliares para inferência
+    └── lapsbm_speecht5/
+        ├── audio/           # WAVs de referência por locutor/frase
+        └── hf_test_split/   # Split HF exportado (opcional)
+```
+
+| Pasta | Função | Como é populada |
+|-------|--------|-----------------|
+| **`raw/`** | Backup offline permanente do Hub | `python scripts/data/download_datasets.py --repo falabrasil/lapsbm` |
+| **`repository/`** | Leitura em treino/inferência (`load_from_disk`) | Streaming HF na 1.ª corrida ou migração manual |
+| **`cache/`** | Evita recomputar mel/NR/splits processados | Gerado automaticamente pelo treino |
+| **`exports/`** | WAVs de referência para métricas/inferência | Scripts de export (ex. legacy `reconstruct_and_export_test_split`) |
+
+**Nota:** `raw/` e `repository/` têm formatos diferentes. O treino usa **`repository/`**; `raw/` serve só como espelho offline opcional.
+
+### Embeddings de teste (`embeddings_test_speakers/`)
+
+Pasta do pipeline de inferência ( **não** legacy): x-vectors pré-exportados dos locutores M031–M034 para o modo `--use-test-embeddings`. Geração:
+
+```powershell
+python scripts/data/export_test_speaker_embeddings.py --device cuda
+```
+
+Com `use_test_embeddings: false` no `config_inference.yaml` (default), a inferência usa `--dataset_reference_audios` em vez desta pasta.
+
+### Migrar pastas antigas
+
+Se ainda tiver `meus_datasets/` ou `datasets/` na raiz:
+
+```powershell
+# na raiz do repo
+New-Item -ItemType Directory -Force data/raw, data/repository, data/cache, data/exports
+Move-Item meus_datasets/* data/raw/ -ErrorAction SilentlyContinue
+Move-Item datasets/lapsbm data/repository/ -ErrorAction SilentlyContinue
+Move-Item datasets/cache_processado/* data/cache/ -ErrorAction SilentlyContinue
+Move-Item datasets/test_split_inferencia/* data/exports/ -ErrorAction SilentlyContinue
+```
 
 # Trabalhando com Datasets Offline (Opcional)
-Se você deseja garantir os gigantescos arquivos de áudio protegidos na sua máquina de forma permanente e sem depender da internet no momento do treinamento (ou pra se proteger caso deletem a base pública original da HuggingFace), os componentes do repositório contam com "interceptação automática offline".
+Para espelhar os repositórios Hugging Face localmente (sem depender da internet no download):
 
-Para clonar e preservar os arquivos de áudio originais (ex: LapsBM, Pt-BR Char), basta rodar nosso utilitário na raiz do projeto:
-- `python download_datasets.py --repo falabrasil/lapsbm`
-- Ou `python download_datasets.py --all` (para realizar o espelhamento de todos os da nossa grade simultaneamente).
+- `python scripts/data/download_datasets.py --repo falabrasil/lapsbm`
+- `python scripts/data/download_datasets.py --all` (LapsBM + pt-br_char)
 
-Isso formará a pasta `/meus_datasets/`. Sempre que você rodar os testes de Inferência ou Treinamento a partir de agora, eles utilizarão primariamente e prioritariamente a leitura nativa isolada nos seus discos rígidos onde a internet se torna irrelevante.
+Os ficheiros vão para **`data/raw/`**. Na primeira corrida de treino, se `data/repository/lapsbm/` ainda não existir, o script faz streaming do Hub e grava em **`data/repository/`** automaticamente.
 
 # Configuração do Treinamento/Fine-Tuning
-Verificar o arquivo `config_train.yaml`, que contém as configurações de treinamento para cada profile (ex: "cuda_16gb", "macbook", "cpu").
-- `config_train.yaml`
-- `config_inference.yaml`: defaults opcionais para `test_inference_exhaustive.py` (carregado automaticamente se existir; ver `--inference_config`).
+Verificar `configs/config_train.yaml` (perfil unificado `profiles.lapsbm_speecht5`: hardware + SpeechT5 + LapsBM) e `configs/config_inference.yaml` (defaults opcionais para inferência; ver `--inference_config`).
 
 # Treina Modelo (Fine Tunning)
 Usando Detecção Automática de Hardware: 
 - `python train_exhaustive.py` 
 
-Usando profile específico (ex: "cuda_16gb" ou "macbook" ou "cpu"):
-- `python train_exhaustive.py --profile "macbook"`
+Usando profile explícito (opcional; o default é `lapsbm_speecht5`):
+- `python train_exhaustive.py --profile lapsbm_speecht5`
 
 Realiza o treinamento de modelo existente em inglês com novos áudios transcritos em português. O objetivo deste fine tunning é permitir que um modelo construído puramente para responder audios em inglês, consigo também responder em português.
 
@@ -64,5 +119,5 @@ Realiza o treinamento de modelo existente em inglês com novos áudios transcrit
 Usando Detecção Automática de Hardware: 
 - `python test_inference_exhaustive.py`
 
-Usando profile específico e modelo específico
-- `python train_exhaustive.py --profile "cuda_16gb" --model_name "SpeechT5-2026-03-30-23-33-05"`
+Com defaults de `configs/config_inference.yaml` (perfil `lapsbm_speecht5`):
+- `python test_inference_exhaustive.py --model_path ".\output_cuda_16gb\...\checkpoint-9100"`

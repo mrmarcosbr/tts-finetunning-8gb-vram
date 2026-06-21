@@ -11,6 +11,10 @@ venv_fs2/
 # Environment Variables
 .env
 
+# Cryptographic keys (never commit private keys)
+private_key.pem
+*_private_key.pem
+
 # Checkpoints / Datasets / Output
 speecht5_laps_lora_exhaustive/
 output_cuda_16gb/
@@ -21,13 +25,18 @@ Treinamento LoRA*
 *.txt
 !requirements*.txt
 !README.md
-!valores_referencia_treinamento.txt
+!legacy/docs/valores_referencia_treinamento.txt
 
+logs/
+!logs/.gitkeep
 output_cpu/
 output_mac/
-meus_datasets/*
-datasets/*
-aval_audios/
+data/
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/repository/.gitkeep
+!data/cache/.gitkeep
+!data/exports/.gitkeep
 scratch/
 *.wav
 
@@ -38,3 +47,4 @@ scratch/
 # Ffmpeg   
 ffmpeg/
 
+*.pem
