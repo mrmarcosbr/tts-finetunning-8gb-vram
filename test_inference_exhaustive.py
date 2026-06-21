@@ -774,6 +774,240 @@ def speecht5_speaker_embedding_from_numpy(
     return torch.from_numpy(vec.copy()).unsqueeze(0).to(device=device, dtype=torch.float32)
 
 
+def describe_inference_reference_audio_origin(
+    item: Optional[Dict[str, Any]], full_cfg: Dict[str, Any], dataset_profile: str
+) -> str:
+    """Uma linha legível para logs: WAV export ou path HF do clip de referência."""
+    if not item:
+        return "(sem linha HF)"
+    ex = exported_reference_wav_fallback_path(item, full_cfg, dataset_profile)
+    if ex and os.path.isfile(ex):
+        return os.path.abspath(ex)
+    au = item.get("audio") or item.get("wav") or {}
+    if isinstance(au, dict) and au.get("path"):
+        return str(au["path"])
+    return "(áudio apenas em arrow/array ou path desconhecido)"
+
+
+def pick_longest_reference_candidate_per_speaker(
+    candidates: List[InferenceCandidate],
+    full_cfg: Dict[str, Any],
+    dataset_profile: str,
+    encoder_sr: int,
+) -> Dict[str, InferenceCandidate]:
+    """
+    Para cada locutor com ID conhecido, escolhe a amostra cujo WAV de referência resolve
+    (HF ou exportado) é o mais longo em amostras@encoder_sr.
+    """
+    best: Dict[str, Tuple[int, InferenceCandidate]] = {}
+
+    def better(new_n: int, new_c: InferenceCandidate, prev: Tuple[int, InferenceCandidate]) -> bool:
+        if new_n > prev[0]:
+            return True
+        if new_n < prev[0]:
+            return False
+        id_new = (
+            format_sentence_id_display(new_c.dataset_item)
+            if new_c.dataset_item
+            else new_c.text_raw or ""
+        )
+        id_prev = (
+            format_sentence_id_display(prev[1].dataset_item)
+            if prev[1].dataset_item
+            else prev[1].text_raw or ""
+        )
+        return id_new < id_prev
+
+    for c in candidates:
+        if not c.dataset_item:
+            continue
+        spk = extract_speaker_id(c.dataset_item)
+        if not spk or spk == "unknown":
+            continue
+        y, sr = resolve_reference_waveform_for_inference(
+            c.dataset_item,
+            encoder_sr,
+            full_cfg=full_cfg,
+            dataset_profile=dataset_profile,
+        )
+        n = int(y.size) if y is not None and y.size else 0
+        if n <= 0:
+            continue
+        prev = best.get(spk)
+        if prev is None or better(n, c, prev):
+            best[spk] = (n, c)
+
+    return {spk: t[1] for spk, t in best.items()}
+
+
+def write_default_texts_speaker_embedding_reference_log(
+    out_dir: str,
+    *,
+    full_cfg: Dict[str, Any],
+    dataset_profile: str,
+    encoder_sr: int,
+    train_by_spk: Dict[str, InferenceCandidate],
+    test_by_spk: Dict[str, InferenceCandidate],
+    run_frases_para_rotacao: Optional[List[str]] = None,
+) -> None:
+    """
+    Lista os clips de referência mais longos **por cada locutor** (catálogo por split).
+
+    Opcionalmente, com ``run_frases_para_rotacao``, acrescenta a tabela efectiva por
+    ``sentenca_N`` ao condicionamento de cada frase (rodízio em listas ordenadas lexicográfico).
+    """
+    path = os.path.join(out_dir, "audios_referencia_embeddings_default_texts.txt")
+
+    def section(title: str, by_spk: Dict[str, InferenceCandidate]) -> List[str]:
+        lines: List[str] = []
+        lines.append(title)
+        lines.append("")
+        for spk in sorted(by_spk.keys()):
+            cand = by_spk[spk]
+            txt = cand.text_raw.strip() if cand.text_raw else _pick_text_from_item(cand.dataset_item or {})
+            y, sr = resolve_reference_waveform_for_inference(
+                cand.dataset_item,
+                encoder_sr,
+                full_cfg=full_cfg,
+                dataset_profile=dataset_profile,
+            )
+            dur = float(y.size) / float(sr) if y is not None and sr and y.size else 0.0
+            stem = ""
+            sid = ""
+            if cand.dataset_item:
+                stem = reference_wav_stem_for_export(cand.dataset_item) or "(sem stem)"
+                sid = format_sentence_id_display(cand.dataset_item)
+            origin = describe_inference_reference_audio_origin(cand.dataset_item, full_cfg, dataset_profile)
+            lines.append(f"id_locutor: {spk}")
+            lines.append(f"id_sentenca_clip: {sid}")
+            lines.append(f"stem_wav_clip: {stem}")
+            lines.append(f"duracao_resolve_s_seg: {dur:.4f}")
+            lines.append(f"transcricao_clip: {txt}")
+            lines.append(f"origem_clip: {origin}")
+            lines.append("")
+        return lines
+
+    body: List[str] = []
+    body.append("Áudios de referência utilizados nas inferências default_texts (x-vector SpeechBrain)")
+    body.append("")
+    body.append(
+        "IMPORTANTE: as secções «Base TESTE» e «Base TREINO» abaixo são um **catálogo** "
+        "(um clip mais longo por **cada** locutor encontrado naquele split). "
+        "Em cada WAV `*_base_treino_*` / `*_base_teste_*` só entra **um** x-vector por vez "
+        "(ver secção «Esta execução», se incluída)."
+    )
+    body.append(
+        "Modo `sentenca_N_sem_embedding_*`: não se usa WAV de referência; o condicionamento 1×512 é vetor zero."
+    )
+    body.append("")
+    body.append(
+        "(subconjunto TESTE ou TREINO = como em load_inference_test_candidates / "
+        "load_inference_train_candidates; um clip por locutor = o mais longo após resolver o WAV)."
+    )
+    body.append(
+        "Para a frase de ordem i (primeira linha tem i=1), o locutor utilizado cicla sobre a lista de "
+        "locutores ordenada lexicograficamente: índice (i - 1) mod N nos modos com sufixos "
+        "`_base_treino` e `_base_teste`."
+    )
+    body.append(
+        "Ordem das saídas: por cada `sentenca_N` são gerados em sequência os três grupos WAV "
+        "(_sem_embedding, _base_treino, _base_teste) antes de passar a `sentenca_{N+1}`."
+    )
+    body.append("")
+    body.extend(section("=== Base TESTE (holdout / split exportado quando existente) ===", test_by_spk))
+    body.extend(section("=== Base TREINO (locutores bucket train do zero_shot_split) ===", train_by_spk))
+    body.append("")
+    body.append("(Sufixo nos WAV gravados antes de `_base` / `_treinado`: `_sem_embedding`, `_base_treino`, `_base_teste`.)")
+
+    train_ord = sorted(train_by_spk.keys())
+    test_ord = sorted(test_by_spk.keys())
+    rt = (
+        [(ln or "").strip() for ln in (run_frases_para_rotacao or [])]
+        if run_frases_para_rotacao
+        else []
+    )
+    if rt and train_ord and test_ord:
+        body.append("")
+        body.append("=== Esta execução — locutor por número de sentença (rotação) ===")
+        body.append(
+            "Regra implementada — para a frase índice j (primeira entrada j=1), "
+            "prefix `sentenca_j_base_treino`: locutor train = train_ord[(j-1) mod Nt]; "
+            "`sentenca_j_base_teste`: locutor teste = test_ord[(j-1) mod Ne]. "
+            "Nt/Ne = n. de locutores nos catálogos treino/teste.")
+        body.append("")
+        for idx, texto in enumerate(rt):
+            j = idx + 1
+            tr_sp = train_ord[idx % len(train_ord)]
+            ts_sp = test_ord[idx % len(test_ord)]
+            tr_cand = train_by_spk.get(tr_sp)
+            ts_cand = test_by_spk.get(ts_sp)
+            peek = texto if len(texto) <= 120 else texto[:117].rstrip() + "..."
+            tr_sid = ""
+            ts_sid = ""
+            if tr_cand and tr_cand.dataset_item:
+                tr_sid = format_sentence_id_display(tr_cand.dataset_item)
+            if ts_cand and ts_cand.dataset_item:
+                ts_sid = format_sentence_id_display(ts_cand.dataset_item)
+            body.append(f"sentenca_{j} (texto entrada TTS, resumo)")
+            body.append(f"    {peek}")
+            body.append(f"  → modo `_base_treino`: locutor `{tr_sp}` | clip catálogo `{tr_sid}`")
+            body.append(f"  → modo `_base_teste`: locutor `{ts_sp}` | clip catálogo `{ts_sid}`")
+            body.append("")
+
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(body).rstrip() + "\n")
+    print(f"   📄 Registo refs. embedding default_texts → {path}")
+
+
+def write_default_texts_triple_expected_filenames_manifest(
+    out_dir: str,
+    *,
+    args: argparse.Namespace,
+    triple_emb_passes: List[Tuple[Optional[str], str]],
+    n_frases: int,
+) -> str:
+    """
+    Lista os stems WAV esperados (default_texts triplo) para procurar na raiz da pasta de inferência.
+    Útil no Windows onde o * não corresponde a '.', e como prova do nome exacto quando o modo triplo está ligado.
+    """
+    manifest = Path(out_dir) / "nom_wavs_esperados_default_texts_triplo.txt"
+    header = [
+        "Stems WAV esperados com `--default-texts-triple-speaker-embedding` (YAML ou CLI).",
+        "",
+        "Os ficheiros cujo nome contém `sentenca_N_sem_embedding` ou `sentenca_N_base_treino` (antes de `_base.wav`)",
+        "**só** são escritos quando este modo está activo neste script.",
+        "",
+        "PowerShell na raíz desta pasta:",
+        "  Get-ChildItem -LiteralPath . | Where-Object { $_.Name -match 'sem_embedding|base_treino|base_teste' }",
+        "",
+    ]
+    cols: List[str] = []
+
+    def row_for_sentence(i_sentence: int) -> None:
+        pfx0 = inference_wav_prefix(args, i_sentence)
+        cols.append(f"--- Frase núm. {i_sentence + 1} (stem base: {pfx0}) ---")
+        for triple_fname_tag, triple_kind in triple_emb_passes:
+            if triple_fname_tag is None:
+                stem = pfx0
+                cols.append(f"  {stem}_base.wav   {stem}_treinado.wav   (inferência habitual, modo triplo deslig.)")
+                continue
+            stem = f"{pfx0}_{triple_fname_tag}"
+            tail = "(x-vector zero; típico SEM *_referencia*.wav neste modo)"
+            if triple_kind != "SEM_ZERO":
+                tail = "(x-vector pelo clip mais longo do locutor; típico COM *_referencia*.wav)"
+            cols.append(f"  {stem}_base.wav   {stem}_treinado.wav   {stem}_referencia.wav   [{triple_fname_tag}] {tail}")
+
+    nf = max(0, int(n_frases))
+    cols.append("")
+    cols.append("(Primeiras linhas exemplo; todas as frases do run:)")
+    for i_sn in range(nf):
+        row_for_sentence(i_sn)
+        cols.append("")
+
+    manifest.write_text("\n".join(header + cols).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return str(manifest)
+
+
 def speecht5_embedding_for_inference_candidate(
     effective_cand: Optional[Any],
     *,
@@ -2006,6 +2240,20 @@ def main():
         help="Pasta com manifest.json + spk_*.npy (export_test_speaker_embeddings.py).",
     )
     parser.add_argument(
+        "--default-texts-triple-speaker-embedding",
+        action="store_true",
+        dest="default_texts_triple_speaker_embedding",
+        help=(
+            "SpeechT5: apenas default_texts, três passagens — (1) sem x-vector "
+            "(2) x-vector de clip mais longo por locutor no subset treino "
+            "(3) idem no subset teste. WAV: prefixos sentenca_N_sem_embedding_* , "
+            "sentenca_N_base_treino_* , sentenca_N_base_teste_* antes de _base/_treinado/_referencia. "
+            "grava também audios_referencia_embeddings_default_texts.txt. Incompatível com --text "
+            "(non-vazio), --dataset_reference_audios, --infer_all_test_sentences, --use-test-embeddings, "
+            "--speecht5_zero_speaker_embedding."
+        ),
+    )
+    parser.add_argument(
         "--trained_bass_cut_hz",
         type=float,
         default=120.0,
@@ -2141,7 +2389,7 @@ def main():
     parser.add_argument(
         "--wer_cer_whisper_model",
         type=str,
-        default="openai/whisper-small",
+        default="openai/whisper-large-v3",
         metavar="HF_ID",
         help="Modelo ASR para WER/CER (Whisper no HF).",
     )
@@ -2314,6 +2562,11 @@ def main():
     args = parser.parse_args()
     if inference_yaml_path is not None:
         print(f"📄 inference_config: {inference_yaml_path}")
+    if getattr(args, "default_texts_triple_speaker_embedding", False):
+        print(
+            "   🔛 `--default-texts-triple-speaker-embedding` ACTIVO → os WAV usarão stems do tipo "
+            "`sentenca_N_sem_embedding_*`, `*_base_treino_*`, `*_base_teste_*` antes de `_base`/`_treinado`."
+        )
 
     if getattr(args, "only_f0_rmse_dir", None):
         cf0 = bool(getattr(args, "compute_f0_rmse", False))
@@ -2346,7 +2599,7 @@ def main():
             nr_prop_decrease=float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE)),
             nr_peak_match=not bool(getattr(args, "no_noise_peak_match", False)),
             wer_cer=cwer,
-            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-small")),
+            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-large-v3")),
             whisper_language=str(getattr(args, "wer_cer_whisper_language", "portuguese")),
             asr_device=str(getattr(args, "wer_cer_device", None) or "cuda"),
             references_map=None,
@@ -2548,11 +2801,11 @@ def main():
         "Que otima noticia, o treinamento terminou sem erros",
         "O treinamento exaustivo foi finalizado com sucesso.",
         "Esta é uma demonstração de voz gerada por inteligência artificial.",
-        # "A qualidade do áudio melhorou significativamente após o ajuste fino.",
-        # "Estamos testando a comparação entre o modelo base e o modelo treinado.",
-        # "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
-        # "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluída... Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto.",
-        # "Era uma vez um pequeno robô chamado Pip que vivia numa floresta de cristal onde as árvores tilintavam ao vento como sinos de vidro. Ele passava seus dias colecionando sons esquecidos. O suspiro de uma flor ao amanhecer, o ronco distante de um trovão tímido, o risinho abafado de um cogumelo quando a chuva fazia cócegas em seu chapéu. Até que certa manhã encontrou uma velhinha chamada Zara que carregava numa mala de couro uma única palavra que havia perdido em sonho, e Pip, com todo o carinho de seus circuitos dourados, abriu o peito e reproduziu o som exato, e a palavra voltou a existir, e a velhinha sorriu tão amplamente que as estrelas, mesmo sendo de dia, resolveram aparecer só pra ver.",
+        "A qualidade do áudio melhorou significativamente após o ajuste fino.",
+        "Estamos testando a comparação entre o modelo base e o modelo treinado.",
+        "Agora vamos testar uma sentença um pouco mais longa. A ideia é avaliar se nosso novo modelo Text To Speech consegue lidar com frases um pouco maiores.",
+        "Este é um teste longo de texto. A ideia é avaliar se nosso modelo Text To Speech consegue lidar com frases mais complexas e variadas, incluindo vírgula e ponto final. Vamos ver como ele se sai com esta sentença que tem mais de vinte palavras, o que é um bom desafio para a geração de áudio realista e fluída... Se tudo correr bem, o resultado deve soar natural e coerente, mesmo com a extensão do texto.",
+        "Era uma vez um pequeno robô chamado Pip que vivia numa floresta de cristal onde as árvores tilintavam ao vento como sinos de vidro. Ele passava seus dias colecionando sons esquecidos. O suspiro de uma flor ao amanhecer, o ronco distante de um trovão tímido, o risinho abafado de um cogumelo quando a chuva fazia cócegas em seu chapéu. Até que certa manhã encontrou uma velhinha chamada Zara que carregava numa mala de couro uma única palavra que havia perdido em sonho, e Pip, com todo o carinho de seus circuitos dourados, abriu o peito e reproduziu o som exato, e a palavra voltou a existir, e a velhinha sorriu tão amplamente que as estrelas, mesmo sendo de dia, resolveram aparecer só pra ver.",
     ]
     
     dataset_test_limit = getattr(args, "dataset_sentence_limit", 5)
@@ -2568,6 +2821,13 @@ def main():
     has_ds_train = getattr(args, "dataset_train_reference_audios", False) and model_type == "speecht5"
     infer_all_fastspeech2 = infer_all_test and model_type == "fastspeech2"
 
+    triple_default_texts_emb = bool(getattr(args, "default_texts_triple_speaker_embedding", False))
+    triple_train_by_spk: Dict[str, InferenceCandidate] = {}
+    triple_test_by_spk: Dict[str, InferenceCandidate] = {}
+    triple_train_spk_order: List[str] = []
+    triple_test_spk_order: List[str] = []
+    triple_emb_passes: List[Tuple[Optional[str], str]] = [(None, "DEFAULT")]
+
     if infer_all_test:
         if stripped_user:
             print("❌ Não combines --text com --infer_all_test_sentences.")
@@ -2578,7 +2838,91 @@ def main():
             )
             has_ds_train = False
 
-    if has_ds_test or has_ds_train or infer_all_fastspeech2:
+    if triple_default_texts_emb:
+        if model_type != "speecht5":
+            print("❌ --default_texts_triple_speaker_embedding só é suportado com modelo SpeechT5.")
+            sys.exit(1)
+        if stripped_user:
+            print(
+                "❌ --default_texts_triple_speaker_embedding não combina com --text não vazio; "
+                "usa só os textos de default_texts no script.",
+            )
+            sys.exit(1)
+        if infer_all_test:
+            print("❌ Não combines --infer_all_test_sentences com --default_texts_triple_speaker_embedding.")
+            sys.exit(1)
+        if has_ds_test or has_ds_train:
+            print(
+                "❌ Não combines --dataset_reference_audios / --dataset_train_reference_audios "
+                "com --default_texts_triple_speaker_embedding (subconjuntos treino/testte são definidos dentro do modo)."
+            )
+            sys.exit(1)
+        if getattr(args, "use_test_embeddings", False):
+            print("❌ Não combines --use-test-embeddings com --default_texts_triple_speaker_embedding.")
+            sys.exit(1)
+        if getattr(args, "speecht5_zero_speaker_embedding", False):
+            print(
+                "❌ --speecht5_zero_speaker_embedding desativa o SpeechBrain encoder; "
+                "--default_texts_triple_speaker_embedding precisa do encoder nos modos "
+                "`_base_treino` / `_base_teste`. Remove um dos dois.",
+            )
+            sys.exit(1)
+        encoder_sr_pick = int(model_cfg.get("sampling_rate", 16000))
+        full_train_cands = load_inference_train_candidates(full_cfg, ds_cfg, dataset_name)
+        full_test_cands = load_inference_test_candidates(full_cfg, ds_cfg, dataset_name)
+        triple_train_by_spk = pick_longest_reference_candidate_per_speaker(
+            full_train_cands,
+            full_cfg,
+            dataset_name,
+            encoder_sr_pick,
+        )
+        triple_test_by_spk = pick_longest_reference_candidate_per_speaker(
+            full_test_cands,
+            full_cfg,
+            dataset_name,
+            encoder_sr_pick,
+        )
+        if not triple_train_by_spk:
+            print(
+                "❌ --default_texts_triple_speaker_embedding: sem WAV de referência resolvível no subset treino "
+                "(subset locutor «train», cache HF ou export)."
+            )
+            sys.exit(1)
+        if not triple_test_by_spk:
+            print(
+                "❌ --default_texts_triple_speaker_embedding: sem WAV de referência resolvível no subset teste."
+            )
+            sys.exit(1)
+        triple_train_spk_order = sorted(triple_train_by_spk.keys())
+        triple_test_spk_order = sorted(triple_test_by_spk.keys())
+        inference_run_rows = None
+        dataset_picked_candidates = None
+        test_texts = _merge_unique_texts([], default_texts)
+        triple_emb_passes = [
+            ("sem_embedding", "SEM_ZERO"),
+            ("base_treino", "PICK_TRAIN"),
+            ("base_teste", "PICK_TEST"),
+        ]
+        print(
+            f"   📋 default_texts triplo: {len(test_texts)} frase(s) × {len(triple_emb_passes)} condicionamentos; "
+            f"locutores treino(teste) nos modos embedding: "
+            f"{len(triple_train_spk_order)} / {len(triple_test_spk_order)}.",
+        )
+        print(
+            "   📎 Por frase: os três condicionamentos seguem nesta ordem — `_sem_embedding`, "
+            "`_base_treino`, `_base_teste`; locutor ciclicamente sobre a lista ordenada de cada split. "
+            "`audios_referencia_embeddings_default_texts.txt` após criar pasta de saída."
+        )
+        _pfx_ex = inference_wav_prefix(args, 0)
+        print(
+            f"   📝 Exemplo de nomes na **raíz** da pasta deste run (frase 1): "
+            f"{_pfx_ex}_sem_embedding_base.wav | {_pfx_ex}_base_treino_base.wav | {_pfx_ex}_base_teste_base.wav"
+        )
+        print(
+            "   💡 Sem estes intermediários (`_sem_embedding_`, `_base_treino_`) no nome, o output é o modo habitual "
+            "(`sentenca_N_base.wav` só)."
+        )
+    elif has_ds_test or has_ds_train or infer_all_fastspeech2:
         merged_rows: List[InferenceCandidate] = []
         n_frm_test_split = 0
         n_frm_train_split = 0
@@ -2769,9 +3113,28 @@ def main():
 
     # 4. Criar pasta de saída
     type_str = "custom" if args.text else "batch"
+    if triple_default_texts_emb:
+        type_str = "default_texts_triple_emb"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(model_path, f"inference_{type_str}_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
+    if triple_default_texts_emb:
+        write_default_texts_speaker_embedding_reference_log(
+            out_dir,
+            full_cfg=full_cfg,
+            dataset_profile=dataset_name,
+            encoder_sr=int(model_cfg.get("sampling_rate", 16000)),
+            train_by_spk=triple_train_by_spk,
+            test_by_spk=triple_test_by_spk,
+            run_frases_para_rotacao=test_texts,
+        )
+        _mani_triplo = write_default_texts_triple_expected_filenames_manifest(
+            out_dir,
+            args=args,
+            triple_emb_passes=triple_emb_passes,
+            n_frases=len(test_texts),
+        )
+        print(f"   📎 Lista completa de stems WAV esperados → {os.path.basename(_mani_triplo)}")
     write_inference_sentences_txt(out_dir, test_texts)
     write_per_sentence_transcripts_and_tsv(out_dir, test_texts, args)
 
@@ -2783,7 +3146,15 @@ def main():
             f"(3) _pt_treinado = LoRA + PT"
         )
     else:
-        print(f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças...")
+        if triple_default_texts_emb:
+            n_pass = len(triple_emb_passes)
+            print(
+                f"\n   🎙️ Iniciando geração (default_texts triplo × locutor mais longo): "
+                f"{len(test_texts)} frases × {n_pass} passagens = "
+                f"{len(test_texts) * n_pass} grupos WAV (ordenar por prefixo)."
+            )
+        else:
+            print(f"\n   🎙️ Iniciando geração de {len(test_texts)} sentenças...")
     print(f"   🎯 Resultados em: {out_dir}")
     print(
         "   📏 (mesmo SR) tamanho WAV ≈ proporcional à duração; treinado muito menor ⇒ geralmente "
@@ -2850,6 +3221,7 @@ def main():
         model_type == "speecht5"
         and _pool_k > 1
         and not getattr(args, "speecht5_zero_speaker_embedding", False)
+        and not triple_default_texts_emb
     ):
         speecht5_spk_pool_index = build_speecht5_speaker_pool_index(
             full_cfg,
@@ -2889,89 +3261,65 @@ def main():
     }
 
     # 5. Executar Inferência
+    # Frase primeiro, modo embedding depois — se o job parar ao meio, há sentenca_1…K completas
+    # (× _sem_embedding, _base_treino, _base_teste) em vez de um mesmo modo apenas para algumas frases.
     for i, text in enumerate(test_texts):
-        cand_row = inference_run_rows[i] if inference_run_rows is not None and i < len(inference_run_rows) else None
-        effective_cand = cand_row
-        if effective_cand is None and dataset_pick_lookup:
-            effective_cand = dataset_pick_lookup.get(normalize_text(text.strip()))
-
-        print(f"\n   --- Teste {i+1}/{len(test_texts)} ---")
-        if (
-            model_type == "speecht5"
-            and effective_cand is not None
-            and effective_cand.dataset_item is not None
-        ):
-            print(
-                f"   🏷️ Locutor={extract_speaker_id(effective_cand.dataset_item)} | "
-                f"sentença={format_sentence_id_display(effective_cand.dataset_item)}"
+        for triple_fname_tag, triple_pass_kind in triple_emb_passes:
+            cand_row = (
+                inference_run_rows[i]
+                if inference_run_rows is not None and i < len(inference_run_rows)
+                else None
             )
-        clean_text = normalize_text(text)
-        prefix = inference_wav_prefix(args, i)
+            effective_cand = cand_row
+            if triple_default_texts_emb:
+                if triple_pass_kind == "SEM_ZERO":
+                    effective_cand = None
+                elif triple_pass_kind == "PICK_TRAIN":
+                    if not triple_train_spk_order:
+                        print("❌ lista de locutores treino vazia (triple).")
+                        sys.exit(1)
+                    _sp_pick = triple_train_spk_order[i % len(triple_train_spk_order)]
+                    effective_cand = triple_train_by_spk[_sp_pick]
+                elif triple_pass_kind == "PICK_TEST":
+                    if not triple_test_spk_order:
+                        print("❌ lista de locutores teste vazia (triple).")
+                        sys.exit(1)
+                    _sp_pick = triple_test_spk_order[i % len(triple_test_spk_order)]
+                    effective_cand = triple_test_by_spk[_sp_pick]
 
-        gen_spk = speaker_emb
-        if model_type == "speecht5":
-            exported_npy_this_row = (
-                getattr(args, "use_test_embeddings", False)
-                and test_exported_emb_apply is not None
-                and i < len(test_exported_emb_apply)
-                and test_exported_emb_apply[i]
+            elif effective_cand is None and dataset_pick_lookup:
+                effective_cand = dataset_pick_lookup.get(normalize_text(text.strip()))
+
+            _pass_head = (
+                f"[{triple_fname_tag}] "
+                if (triple_default_texts_emb and triple_fname_tag)
+                else ""
             )
-            if exported_npy_this_row:
-                s_ix = test_exported_emb_counter % len(test_exported_emb_order)
-                gen_spk = test_exported_emb_tensors[s_ix]
-                spk_lab = test_exported_emb_order[s_ix]
+            print(f"\n   --- {_pass_head}Frase {i+1}/{len(test_texts)} ---")
+            if (
+                model_type == "speecht5"
+                and effective_cand is not None
+                and effective_cand.dataset_item is not None
+            ):
                 print(
-                    f"   🔊 Speaker conditioning: x-vector exportado {spk_lab} "
-                    f"(--use-test-embeddings; uso #{test_exported_emb_counter + 1} no ciclo "
-                    f"{test_exported_emb_order})"
+                    f"   🏷️ Locutor (ref. embedding/recorte)="
+                    f"{extract_speaker_id(effective_cand.dataset_item)} | "
+                    f"clip={format_sentence_id_display(effective_cand.dataset_item)}"
                 )
-                test_exported_emb_counter += 1
-            elif getattr(args, "speecht5_zero_speaker_embedding", False):
-                gen_spk = torch.zeros((1, 512), dtype=torch.float32, device=device)
-                print(
-                    "   🔊 Speaker conditioning: vetor zero (--speecht5_zero_speaker_embedding); "
-                    "compara com runs x-vector quando necessário."
-                )
-            else:
-                pool_k = int(getattr(args, "speecht5_speaker_emb_pool_size", 1) or 1)
-                emb_how = ""
-                if (
-                    pool_k > 1
-                    and speecht5_spk_pool_index
-                    and effective_cand is not None
-                    and effective_cand.dataset_item is not None
-                ):
-                    pool_cands = select_speecht5_embedding_pool_candidates(
-                        effective_cand,
-                        speecht5_spk_pool_index,
-                        pool_k,
-                        seed=getattr(args, "speecht5_speaker_emb_pool_seed", None),
-                    )
-                    gen_spk, emb_how, used_pool = speecht5_pooled_speaker_embedding_from_candidates(
-                        pool_cands,
-                        pool_mode=str(getattr(args, "speecht5_speaker_emb_pool_mode", "mean")),
-                        encoder_sr=int(model_cfg.get("sampling_rate", 16000)),
-                        speaker_model=speecht5_speaker_model,
-                        device=device,
-                        full_cfg=full_cfg,
-                        dataset_profile=dataset_name,
-                        concat_gap_sec=float(
-                            getattr(args, "speecht5_speaker_emb_pool_concat_gap_sec", 0.25)
-                        ),
-                    )
-                    if emb_how != "pool_sem_wav":
-                        id_parts = [
-                            format_sentence_id_display(c.dataset_item)
-                            for c in used_pool[:6]
-                            if c.dataset_item
-                        ]
-                        id_str = ", ".join(id_parts)
-                        if len(used_pool) > 6:
-                            id_str += ", …"
+            clean_text = normalize_text(text)
+            _pfx0 = inference_wav_prefix(args, i)
+            prefix = f"{_pfx0}_{triple_fname_tag}" if triple_fname_tag else _pfx0
+
+            gen_spk = speaker_emb
+            if model_type == "speecht5":
+                if triple_default_texts_emb:
+                    if triple_pass_kind == "SEM_ZERO":
+                        gen_spk = torch.zeros((1, 512), dtype=torch.float32, device=device)
                         print(
-                            f"   🔊 Speaker conditioning: {emb_how} (clipes: {id_str})"
+                            "   🔊 Speaker conditioning: vetor zero (modo `_sem_embedding` "
+                            "em default_texts triplo)."
                         )
-                    else:
+                    elif triple_pass_kind in ("PICK_TRAIN", "PICK_TEST"):
                         gen_spk, emb_how = speecht5_embedding_for_inference_candidate(
                             effective_cand,
                             full_cfg=full_cfg,
@@ -2980,223 +3328,330 @@ def main():
                             speaker_model=speecht5_speaker_model,
                             device=device,
                         )
-                        print("   ⚠️ Pool sem WAV útil — recuou para x-vector só desta sentença.")
-                else:
-                    gen_spk, emb_how = speecht5_embedding_for_inference_candidate(
-                        effective_cand,
-                        full_cfg=full_cfg,
-                        dataset_profile=dataset_name,
-                        model_cfg=model_cfg,
-                        speaker_model=speecht5_speaker_model,
-                        device=device,
-                    )
-                if emb_how == "x-vector_do_WAV_referência":
-                    print(
-                        "   🔊 Speaker conditioning: SpeechBrain x-vector (mesmo áudio "
-                        "que alimenta F0/ref. e *_referencia.wav)."
-                    )
-                elif emb_how and (
-                    emb_how.startswith("x-vector_mean_") or emb_how.startswith("x-vector_concat_")
-                ):
-                    pass
-                else:
-                    print(
-                        f"   ⚠️ Speaker conditioning: embedding zero ou inválido ({emb_how}); "
-                        "preferir WAV de referência na linha HF ou export "
-                        "`test_split_inferencia/...` ou `--speecht5_zero_speaker_embedding`."
-                    )
-                mix_mode = getattr(args, "speecht5_speaker_emb_mix_mode", "toward_neutral") or "toward_neutral"
-                wmix = float(max(0.0, min(1.0, getattr(args, "speecht5_speaker_emb_mix", 0.0))))
-                blended = False
-                if mix_mode == "toward_neutral" and wmix > 0.0:
-                    gen_spk = blend_speecht5_speaker_embedding(
-                        gen_spk, wmix, mode=mix_mode
-                    )
-                    blended = True
-                elif mix_mode == "linear_gain" and wmix < 1.0:
-                    gen_spk = blend_speecht5_speaker_embedding(
-                        gen_spk, wmix, mode="linear_gain"
-                    )
-                    blended = True
-                if blended:
-                    print(
-                        f"   🔀 mistura aplicada (--speecht5_speaker_emb_mix_mode {mix_mode} w={wmix:g}) "
-                        "antes de SpeechT5.generate."
-                    )
-
-        if model_type == "fastspeech2":
-            # 1) model.pth, EN, sem LoRA
-            print(f"   (1) _ljs_english — model.pth, EN, sem LoRA...")
-            try:
-                audio_ljs = handler.generate(
-                    clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="ljs_en"
-                )
-                p_ljs = os.path.join(out_dir, f"{prefix}_ljs_english.wav")
-                audio_ljs_out = _finalize_audio(audio_ljs, is_trained=False)
-                write_wav_and_mp3(p_ljs, audio_ljs_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_ljs, audio_ljs_out, sampling_rate)
-            except Exception as e:
-                print(f"   ⚠️ Erro (LJS/EN): {e}")
-
-            # 2) model.pth + PT (Gruut), sem LoRA
-            print(f"   (2) _pt_original — model.pth + PT (tokenizer + Gruut)...")
-            try:
-                audio_pt_base = handler.generate(
-                    clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="pt_base"
-                )
-                p_pt_base = os.path.join(out_dir, f"{prefix}_pt_original.wav")
-                audio_pt_base_out = _finalize_audio(audio_pt_base, is_trained=False)
-                write_wav_and_mp3(p_pt_base, audio_pt_base_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_pt_base, audio_pt_base_out, sampling_rate)
-            except Exception as e:
-                print(f"   ⚠️ Erro (base+PT): {e}")
-                audio_pt_base = None
-
-            # 3) LoRA + PT
-            print(f"   (3) _pt_treinado — LoRA + PT...")
-            try:
-                audio_lora = handler.generate(
-                    clean_text, speaker_emb, use_lora=True, fastspeech2_pipeline="pt_lora"
-                )
-                p_lora = os.path.join(out_dir, f"{prefix}_pt_treinado.wav")
-                audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
-                write_wav_and_mp3(p_lora, audio_lora_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_lora, audio_lora_out, sampling_rate)
-                if audio_pt_base is not None and len(np.asarray(audio_pt_base).reshape(-1)) > 0:
-                    ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_pt_base).reshape(-1))
-                    print(f"      📊 Razão duração pt_treinado / pt_base ≈ {ratio:.2f}×")
-                if args.text and i == 0:
-                    write_wav_and_mp3("output_inference.wav", audio_lora_out, sampling_rate, **_mp3_kw)
-            except Exception as e:
-                print(f"   ⚠️ Erro (LoRA+PT): {e}")
-        else:
-            # Outros modelos: mantém pares base vs LoRA
-            print(f"   🔊 Gerando BASE (SpeechT5 sem LoRA)...")
-            try:
-                audio_orig = handler.generate(clean_text, gen_spk, use_lora=False)
-                p_base_wav = os.path.join(out_dir, f"{prefix}_base.wav")
-                audio_orig_out = _finalize_audio(audio_orig, is_trained=False)
-                write_wav_and_mp3(p_base_wav, audio_orig_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_base_wav, audio_orig_out, sampling_rate)
-                if getattr(args, "noise_reduce", False):
-                    try:
-                        from inference_noise_reduce import apply_noise_reduce_to_wav_file
-
-                        p_base_nr = os.path.join(out_dir, f"{prefix}_base_nr.wav")
-                        nr_warn_b, dmax_b, ys_b = apply_noise_reduce_to_wav_file(
-                            p_base_wav,
-                            p_base_nr,
-                            **_nr_wav_kw,
+                        lab = (
+                            "_base_treino"
+                            if triple_pass_kind == "PICK_TRAIN"
+                            else "_base_teste"
                         )
-                        if nr_warn_b:
-                            print(f"      ⚠️ {prefix}_base_nr.wav: noisereduce — {nr_warn_b}")
-                        elif dmax_b <= 1e-6 * ys_b:
-                            print(
-                                f"      ⚠️ {os.path.basename(p_base_nr)} muito parecido com _base.wav "
-                                f"(Δmáx={dmax_b:.2e})."
-                            )
-                        else:
-                            print(
-                                f"      🧹 Gravado {os.path.basename(p_base_nr)} "
-                                f"(NR sobre {os.path.basename(p_base_wav)})"
-                            )
-                    except Exception as e_bnr:
-                        print(f"      ⚠️ Falha ao gravar *_base_nr.wav: {e_bnr}")
-                if effective_cand is not None and model_type == "speecht5" and effective_cand.dataset_item is not None:
-                    ya, sra = resolve_reference_waveform_for_inference(
-                        effective_cand.dataset_item,
-                        int(sampling_rate),
-                        full_cfg=full_cfg,
-                        dataset_profile=dataset_name,
-                    )
-                    if ya is not None and ya.size > 0:
-                        p_refs = os.path.join(out_dir, f"{prefix}_referencia.wav")
-                        write_wav_and_mp3(p_refs, np.asarray(ya, dtype=np.float32), int(sra), **_mp3_kw)
-                        _wav_report(p_refs, ya, int(sra))
-                        if getattr(args, "noise_reduce", False):
-                            try:
-                                from inference_noise_reduce import apply_noise_reduce_to_wav_file
-
-                                p_refs_nr = os.path.join(out_dir, f"{prefix}_referencia_nr.wav")
-                                nr_warn_r, dmax_r, ys_r = apply_noise_reduce_to_wav_file(
-                                    p_refs,
-                                    p_refs_nr,
-                                    **_nr_wav_kw,
-                                )
-                                if nr_warn_r:
-                                    print(f"      ⚠️ {prefix}_referencia_nr.wav: noisereduce — {nr_warn_r}")
-                                elif dmax_r <= 1e-6 * ys_r:
-                                    print(
-                                        f"      ⚠️ {os.path.basename(p_refs_nr)} muito parecido com _referencia.wav "
-                                        f"(Δmáx={dmax_r:.2e})."
-                                    )
-                                else:
-                                    print(
-                                        f"      🧹 Gravado {os.path.basename(p_refs_nr)} "
-                                        f"(NR sobre {os.path.basename(p_refs)})"
-                                    )
-                            except Exception as e_rnr:
-                                print(f"      ⚠️ Falha ao gravar *_referencia_nr.wav: {e_rnr}")
-                        if model_type == "speecht5":
-                            save_speecht5_reference_run_extras(
-                                out_dir,
-                                prefix=prefix,
-                                text_raw=text,
-                                p_refs_wav=p_refs,
-                                speaker_model=speecht5_speaker_model,
-                                encoder_sr=speecht5_encoder_sr,
-                                device=device,
-                                manifest_rows=ref_extra_manifest,
-                            )
-                    elif getattr(args, "dataset_reference_audios", False):
+                        msg = emb_how
+                        if emb_how == "x-vector_do_WAV_referência":
+                            msg = "SpeechBrain x-vector (clip mais longo do locutor)."
                         print(
-                            "      ⚠️ WAV de referência não gravado "
-                            "(HF sem array/path e sem correspondente em "
-                            f"test_split_inferencia/{dataset_name}/audio/<locutor>/)."
+                            f"   🔊 Speaker conditioning ({lab}; modo default_texts triplo): {msg}"
                         )
-            except Exception as e:
-                print(f"   ⚠️ Erro no modelo base (sem LoRA): {e}")
-                audio_orig = None
-
-            print(f"   🔥 Gerando TREINADO (LoRA)...")
-            try:
-                audio_lora = handler.generate(clean_text, gen_spk, use_lora=True)
-                p_lora = os.path.join(out_dir, f"{prefix}_treinado.wav")
-                audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
-                write_wav_and_mp3(p_lora, audio_lora_out, sampling_rate, **_mp3_kw)
-                _wav_report(p_lora, audio_lora_out, sampling_rate)
-                if getattr(args, "noise_reduce", False):
-                    try:
-                        from inference_noise_reduce import apply_noise_reduce_to_wav_file
-
-                        p_lora_nr = os.path.join(out_dir, f"{prefix}_treinado_nr.wav")
-                        nr_warn, dmax, yscale = apply_noise_reduce_to_wav_file(
-                            p_lora,
-                            p_lora_nr,
-                            **_nr_wav_kw,
+                        mix_mode = (
+                            getattr(args, "speecht5_speaker_emb_mix_mode", "toward_neutral")
+                            or "toward_neutral"
                         )
-                        if nr_warn:
-                            print(f"      ⚠️ {prefix}_treinado_nr.wav: noisereduce — {nr_warn}")
-                        elif dmax <= 1e-6 * yscale:
-                            print(
-                                f"      ⚠️ {os.path.basename(p_lora_nr)} muito parecido com treinado.wav "
-                                f"(Δmáx={dmax:.2e} vs leitura scipy do .wav). Perfil de ruído fraco ou sinal já limpo."
+                        wmix = float(max(0.0, min(1.0, getattr(args, "speecht5_speaker_emb_mix", 0.0))))
+                        blended_tr = False
+                        if mix_mode == "toward_neutral" and wmix > 0.0:
+                            gen_spk = blend_speecht5_speaker_embedding(
+                                gen_spk, wmix, mode=mix_mode
                             )
+                            blended_tr = True
+                        elif mix_mode == "linear_gain" and wmix < 1.0:
+                            gen_spk = blend_speecht5_speaker_embedding(
+                                gen_spk, wmix, mode="linear_gain"
+                            )
+                            blended_tr = True
+                        if blended_tr:
+                            print(
+                                f"   🔀 mistura aplicada (--speecht5_speaker_emb_mix_mode {mix_mode} "
+                                f"w={wmix:g}) antes de SpeechT5.generate."
+                            )
+                    else:
+                        raise RuntimeError(f"triple_pass_kind inesperado: {triple_pass_kind!r}")
+                else:
+                    exported_npy_this_row = (
+                        getattr(args, "use_test_embeddings", False)
+                        and test_exported_emb_apply is not None
+                        and i < len(test_exported_emb_apply)
+                        and test_exported_emb_apply[i]
+                    )
+                    if exported_npy_this_row:
+                        s_ix = test_exported_emb_counter % len(test_exported_emb_order)
+                        gen_spk = test_exported_emb_tensors[s_ix]
+                        spk_lab = test_exported_emb_order[s_ix]
+                        print(
+                            f"   🔊 Speaker conditioning: x-vector exportado {spk_lab} "
+                            f"(--use-test-embeddings; uso #{test_exported_emb_counter + 1} no ciclo "
+                            f"{test_exported_emb_order})"
+                        )
+                        test_exported_emb_counter += 1
+                    elif getattr(args, "speecht5_zero_speaker_embedding", False):
+                        gen_spk = torch.zeros((1, 512), dtype=torch.float32, device=device)
+                        print(
+                            "   🔊 Speaker conditioning: vetor zero (--speecht5_zero_speaker_embedding); "
+                            "compara com runs x-vector quando necessário."
+                        )
+                    else:
+                        pool_k = int(getattr(args, "speecht5_speaker_emb_pool_size", 1) or 1)
+                        emb_how = ""
+                        if (
+                            pool_k > 1
+                            and speecht5_spk_pool_index
+                            and effective_cand is not None
+                            and effective_cand.dataset_item is not None
+                        ):
+                            pool_cands = select_speecht5_embedding_pool_candidates(
+                                effective_cand,
+                                speecht5_spk_pool_index,
+                                pool_k,
+                                seed=getattr(args, "speecht5_speaker_emb_pool_seed", None),
+                            )
+                            gen_spk, emb_how, used_pool = speecht5_pooled_speaker_embedding_from_candidates(
+                                pool_cands,
+                                pool_mode=str(getattr(args, "speecht5_speaker_emb_pool_mode", "mean")),
+                                encoder_sr=int(model_cfg.get("sampling_rate", 16000)),
+                                speaker_model=speecht5_speaker_model,
+                                device=device,
+                                full_cfg=full_cfg,
+                                dataset_profile=dataset_name,
+                                concat_gap_sec=float(
+                                    getattr(args, "speecht5_speaker_emb_pool_concat_gap_sec", 0.25)
+                                ),
+                            )
+                            if emb_how != "pool_sem_wav":
+                                id_parts = [
+                                    format_sentence_id_display(c.dataset_item)
+                                    for c in used_pool[:6]
+                                    if c.dataset_item
+                                ]
+                                id_str = ", ".join(id_parts)
+                                if len(used_pool) > 6:
+                                    id_str += ", …"
+                                print(f"   🔊 Speaker conditioning: {emb_how} (clipes: {id_str})")
+                            else:
+                                gen_spk, emb_how = speecht5_embedding_for_inference_candidate(
+                                    effective_cand,
+                                    full_cfg=full_cfg,
+                                    dataset_profile=dataset_name,
+                                    model_cfg=model_cfg,
+                                    speaker_model=speecht5_speaker_model,
+                                    device=device,
+                                )
+                                print("   ⚠️ Pool sem WAV útil — recuou para x-vector só desta sentença.")
+                        else:
+                            gen_spk, emb_how = speecht5_embedding_for_inference_candidate(
+                                effective_cand,
+                                full_cfg=full_cfg,
+                                dataset_profile=dataset_name,
+                                model_cfg=model_cfg,
+                                speaker_model=speecht5_speaker_model,
+                                device=device,
+                            )
+                        if emb_how == "x-vector_do_WAV_referência":
+                            print(
+                                "   🔊 Speaker conditioning: SpeechBrain x-vector (mesmo áudio "
+                                "que alimenta F0/ref. e *_referencia.wav)."
+                            )
+                        elif emb_how and (
+                            emb_how.startswith("x-vector_mean_")
+                            or emb_how.startswith("x-vector_concat_")
+                        ):
+                            pass
                         else:
                             print(
-                                f"      🧹 Gravado {os.path.basename(p_lora_nr)} "
-                                f"(NR sobre o mesmo .wav que noise_remove_test.py lê; "
-                                f"Δmáx ≈ {dmax/yscale:.4f} rel. ao pico)"
+                                f"   ⚠️ Speaker conditioning: embedding zero ou inválido ({emb_how}); "
+                                "preferir WAV de referência na linha HF ou export "
+                                "`test_split_inferencia/...` ou `--speecht5_zero_speaker_embedding`."
                             )
-                    except Exception as e_nr:
-                        print(f"      ⚠️ Falha ao gravar *_treinado_nr.wav: {e_nr}")
-                if audio_orig is not None and len(np.asarray(audio_orig).reshape(-1)) > 0:
-                    ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_orig).reshape(-1))
-                    print(f"      📊 Razão duração treinado/base ≈ {ratio:.2f}×")
-                if args.text and i == 0:
-                    write_wav_and_mp3("output_inference.wav", audio_lora_out, sampling_rate, **_mp3_kw)
-            except Exception as e:
-                print(f"   ⚠️ Erro no modelo treinado: {e}")
+                        mix_mode = (
+                            getattr(args, "speecht5_speaker_emb_mix_mode", "toward_neutral")
+                            or "toward_neutral"
+                        )
+                        wmix = float(max(0.0, min(1.0, getattr(args, "speecht5_speaker_emb_mix", 0.0))))
+                        blended = False
+                        if mix_mode == "toward_neutral" and wmix > 0.0:
+                            gen_spk = blend_speecht5_speaker_embedding(
+                                gen_spk, wmix, mode=mix_mode
+                            )
+                            blended = True
+                        elif mix_mode == "linear_gain" and wmix < 1.0:
+                            gen_spk = blend_speecht5_speaker_embedding(
+                                gen_spk, wmix, mode="linear_gain"
+                            )
+                            blended = True
+                        if blended:
+                            print(
+                                f"   🔀 mistura aplicada (--speecht5_speaker_emb_mix_mode {mix_mode} w={wmix:g}) "
+                                "antes de SpeechT5.generate."
+                            )
+
+            if model_type == "fastspeech2":
+                # 1) model.pth, EN, sem LoRA
+                print(f"   (1) _ljs_english — model.pth, EN, sem LoRA...")
+                try:
+                    audio_ljs = handler.generate(
+                        clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="ljs_en"
+                    )
+                    p_ljs = os.path.join(out_dir, f"{prefix}_ljs_english.wav")
+                    audio_ljs_out = _finalize_audio(audio_ljs, is_trained=False)
+                    write_wav_and_mp3(p_ljs, audio_ljs_out, sampling_rate, **_mp3_kw)
+                    _wav_report(p_ljs, audio_ljs_out, sampling_rate)
+                except Exception as e:
+                    print(f"   ⚠️ Erro (LJS/EN): {e}")
+    
+                # 2) model.pth + PT (Gruut), sem LoRA
+                print(f"   (2) _pt_original — model.pth + PT (tokenizer + Gruut)...")
+                try:
+                    audio_pt_base = handler.generate(
+                        clean_text, speaker_emb, use_lora=False, fastspeech2_pipeline="pt_base"
+                    )
+                    p_pt_base = os.path.join(out_dir, f"{prefix}_pt_original.wav")
+                    audio_pt_base_out = _finalize_audio(audio_pt_base, is_trained=False)
+                    write_wav_and_mp3(p_pt_base, audio_pt_base_out, sampling_rate, **_mp3_kw)
+                    _wav_report(p_pt_base, audio_pt_base_out, sampling_rate)
+                except Exception as e:
+                    print(f"   ⚠️ Erro (base+PT): {e}")
+                    audio_pt_base = None
+    
+                # 3) LoRA + PT
+                print(f"   (3) _pt_treinado — LoRA + PT...")
+                try:
+                    audio_lora = handler.generate(
+                        clean_text, speaker_emb, use_lora=True, fastspeech2_pipeline="pt_lora"
+                    )
+                    p_lora = os.path.join(out_dir, f"{prefix}_pt_treinado.wav")
+                    audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
+                    write_wav_and_mp3(p_lora, audio_lora_out, sampling_rate, **_mp3_kw)
+                    _wav_report(p_lora, audio_lora_out, sampling_rate)
+                    if audio_pt_base is not None and len(np.asarray(audio_pt_base).reshape(-1)) > 0:
+                        ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_pt_base).reshape(-1))
+                        print(f"      📊 Razão duração pt_treinado / pt_base ≈ {ratio:.2f}×")
+                    if args.text and i == 0:
+                        write_wav_and_mp3("output_inference.wav", audio_lora_out, sampling_rate, **_mp3_kw)
+                except Exception as e:
+                    print(f"   ⚠️ Erro (LoRA+PT): {e}")
+            else:
+                # Outros modelos: mantém pares base vs LoRA
+                print(f"   🔊 Gerando BASE (SpeechT5 sem LoRA)...")
+                try:
+                    audio_orig = handler.generate(clean_text, gen_spk, use_lora=False)
+                    p_base_wav = os.path.join(out_dir, f"{prefix}_base.wav")
+                    audio_orig_out = _finalize_audio(audio_orig, is_trained=False)
+                    write_wav_and_mp3(p_base_wav, audio_orig_out, sampling_rate, **_mp3_kw)
+                    _wav_report(p_base_wav, audio_orig_out, sampling_rate)
+                    if getattr(args, "noise_reduce", False):
+                        try:
+                            from inference_noise_reduce import apply_noise_reduce_to_wav_file
+    
+                            p_base_nr = os.path.join(out_dir, f"{prefix}_base_nr.wav")
+                            nr_warn_b, dmax_b, ys_b = apply_noise_reduce_to_wav_file(
+                                p_base_wav,
+                                p_base_nr,
+                                **_nr_wav_kw,
+                            )
+                            if nr_warn_b:
+                                print(f"      ⚠️ {prefix}_base_nr.wav: noisereduce — {nr_warn_b}")
+                            elif dmax_b <= 1e-6 * ys_b:
+                                print(
+                                    f"      ⚠️ {os.path.basename(p_base_nr)} muito parecido com _base.wav "
+                                    f"(Δmáx={dmax_b:.2e})."
+                                )
+                            else:
+                                print(
+                                    f"      🧹 Gravado {os.path.basename(p_base_nr)} "
+                                    f"(NR sobre {os.path.basename(p_base_wav)})"
+                                )
+                        except Exception as e_bnr:
+                            print(f"      ⚠️ Falha ao gravar *_base_nr.wav: {e_bnr}")
+                    if effective_cand is not None and model_type == "speecht5" and effective_cand.dataset_item is not None:
+                        ya, sra = resolve_reference_waveform_for_inference(
+                            effective_cand.dataset_item,
+                            int(sampling_rate),
+                            full_cfg=full_cfg,
+                            dataset_profile=dataset_name,
+                        )
+                        if ya is not None and ya.size > 0:
+                            p_refs = os.path.join(out_dir, f"{prefix}_referencia.wav")
+                            write_wav_and_mp3(p_refs, np.asarray(ya, dtype=np.float32), int(sra), **_mp3_kw)
+                            _wav_report(p_refs, ya, int(sra))
+                            if getattr(args, "noise_reduce", False):
+                                try:
+                                    from inference_noise_reduce import apply_noise_reduce_to_wav_file
+    
+                                    p_refs_nr = os.path.join(out_dir, f"{prefix}_referencia_nr.wav")
+                                    nr_warn_r, dmax_r, ys_r = apply_noise_reduce_to_wav_file(
+                                        p_refs,
+                                        p_refs_nr,
+                                        **_nr_wav_kw,
+                                    )
+                                    if nr_warn_r:
+                                        print(f"      ⚠️ {prefix}_referencia_nr.wav: noisereduce — {nr_warn_r}")
+                                    elif dmax_r <= 1e-6 * ys_r:
+                                        print(
+                                            f"      ⚠️ {os.path.basename(p_refs_nr)} muito parecido com _referencia.wav "
+                                            f"(Δmáx={dmax_r:.2e})."
+                                        )
+                                    else:
+                                        print(
+                                            f"      🧹 Gravado {os.path.basename(p_refs_nr)} "
+                                            f"(NR sobre {os.path.basename(p_refs)})"
+                                        )
+                                except Exception as e_rnr:
+                                    print(f"      ⚠️ Falha ao gravar *_referencia_nr.wav: {e_rnr}")
+                            if model_type == "speecht5":
+                                save_speecht5_reference_run_extras(
+                                    out_dir,
+                                    prefix=prefix,
+                                    text_raw=text,
+                                    p_refs_wav=p_refs,
+                                    speaker_model=speecht5_speaker_model,
+                                    encoder_sr=speecht5_encoder_sr,
+                                    device=device,
+                                    manifest_rows=ref_extra_manifest,
+                                )
+                        elif getattr(args, "dataset_reference_audios", False):
+                            print(
+                                "      ⚠️ WAV de referência não gravado "
+                                "(HF sem array/path e sem correspondente em "
+                                f"test_split_inferencia/{dataset_name}/audio/<locutor>/)."
+                            )
+                except Exception as e:
+                    print(f"   ⚠️ Erro no modelo base (sem LoRA): {e}")
+                    audio_orig = None
+    
+                print(f"   🔥 Gerando TREINADO (LoRA)...")
+                try:
+                    audio_lora = handler.generate(clean_text, gen_spk, use_lora=True)
+                    p_lora = os.path.join(out_dir, f"{prefix}_treinado.wav")
+                    audio_lora_out = _finalize_audio(audio_lora, is_trained=True)
+                    write_wav_and_mp3(p_lora, audio_lora_out, sampling_rate, **_mp3_kw)
+                    _wav_report(p_lora, audio_lora_out, sampling_rate)
+                    if getattr(args, "noise_reduce", False):
+                        try:
+                            from inference_noise_reduce import apply_noise_reduce_to_wav_file
+    
+                            p_lora_nr = os.path.join(out_dir, f"{prefix}_treinado_nr.wav")
+                            nr_warn, dmax, yscale = apply_noise_reduce_to_wav_file(
+                                p_lora,
+                                p_lora_nr,
+                                **_nr_wav_kw,
+                            )
+                            if nr_warn:
+                                print(f"      ⚠️ {prefix}_treinado_nr.wav: noisereduce — {nr_warn}")
+                            elif dmax <= 1e-6 * yscale:
+                                print(
+                                    f"      ⚠️ {os.path.basename(p_lora_nr)} muito parecido com treinado.wav "
+                                    f"(Δmáx={dmax:.2e} vs leitura scipy do .wav). Perfil de ruído fraco ou sinal já limpo."
+                                )
+                            else:
+                                print(
+                                    f"      🧹 Gravado {os.path.basename(p_lora_nr)} "
+                                    f"(NR sobre o mesmo .wav que noise_remove_test.py lê; "
+                                    f"Δmáx ≈ {dmax/yscale:.4f} rel. ao pico)"
+                                )
+                        except Exception as e_nr:
+                            print(f"      ⚠️ Falha ao gravar *_treinado_nr.wav: {e_nr}")
+                    if audio_orig is not None and len(np.asarray(audio_orig).reshape(-1)) > 0:
+                        ratio = len(np.asarray(audio_lora).reshape(-1)) / len(np.asarray(audio_orig).reshape(-1))
+                        print(f"      📊 Razão duração treinado/base ≈ {ratio:.2f}×")
+                    if args.text and i == 0:
+                        write_wav_and_mp3("output_inference.wav", audio_lora_out, sampling_rate, **_mp3_kw)
+                except Exception as e:
+                    print(f"   ⚠️ Erro no modelo treinado: {e}")
             
     if model_type == "speecht5" and (
         getattr(args, "compute_f0_rmse", False) or getattr(args, "compute_wer_cer", False)
@@ -3211,6 +3666,16 @@ def main():
         _asr_dev = getattr(args, "wer_cer_device", None) or device
         cf0 = bool(getattr(args, "compute_f0_rmse", False))
         cwer = bool(getattr(args, "compute_wer_cer", False))
+        _wer_refs: Optional[Dict[str, str]] = None
+        if cwer:
+            # pair_prefix no CSV = prefixo completo do WAV (ex.: sentenca_3_base_treino); a referência WER/CER
+            # é sempre o texto sintetizado (default_texts / run), não a transcrição do clip de embedding.
+            _wer_refs = {}
+            for triple_fname_tag, _ in triple_emb_passes:
+                for i, raw_txt in enumerate(test_texts):
+                    p0 = inference_wav_prefix(args, i)
+                    pf = f"{p0}_{triple_fname_tag}" if triple_fname_tag else p0
+                    _wer_refs[pf] = (raw_txt or "").strip()
         rows = compute_metrics_for_inference_dir(
             out_dir,
             sample_rate=args.f0_sample_rate,
@@ -3225,10 +3690,10 @@ def main():
             nr_prop_decrease=float(getattr(args, "noise_prop_decrease", DEFAULT_NR_PROP_DECREASE)),
             nr_peak_match=not bool(getattr(args, "no_noise_peak_match", False)),
             wer_cer=cwer,
-            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-small")),
+            whisper_model=str(getattr(args, "wer_cer_whisper_model", "openai/whisper-large-v3")),
             whisper_language=str(getattr(args, "wer_cer_whisper_language", "portuguese")),
             asr_device=str(_asr_dev),
-            references_map=None,
+            references_map=_wer_refs,
         )
         if rows:
             out_csv = os.path.join(out_dir, "inference_metrics.csv")

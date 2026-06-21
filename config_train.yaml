@@ -1,7 +1,7 @@
 # CONFIGURAÇÕES GERAIS
 # ==============================================================================
 settings:
-  default_dataset_profile: "lapsbm_fastspeech2"
+  default_dataset_profile: "lapsbm_speecht5"
   local_datasets_dir: "./datasets"
 
 # ==============================================================================
@@ -211,11 +211,11 @@ dataset_profiles:
       #   append — mantém as n linhas como single e acrescenta round(n * append_multi_ratio) linhas multi
       #     (ex.: ratio 1.0 ⇒ n+n; 0.5 ⇒ n + n/2). Embaralhamento final (seed+100003 se seed definido).
       speecht5_train_spk_pool_mix_mode: append
-      speecht5_train_spk_pool_append_multi_ratio: 0.5
+      speecht5_train_spk_pool_append_multi_ratio: 0.2
       # --- REPLACE: fração multi por linha (~30% multi + ~70% single quando 0.3). Ignorado em append.
       # speecht5_train_spk_pool_multi_fraction: 0.5 ≈ 50% amostras multi (concat/mean conforme modo) + 50% single tradicional.
       # 1.0 = 100% multi (comportamento antigo). 0 = nunca funde (treino só single, apesar de K>1 na config).
-      speecht5_train_spk_pool_multi_fraction: 0.3 # irrelevante em append; mantido para voltares a replace sem editar tudo
+      speecht5_train_spk_pool_multi_fraction: 0.2 # irrelevante em append; mantido para voltares a replace sem editar tudo
       speecht5_train_spk_pool_size: 2
       speecht5_train_spk_pool_mode: concat  # mean | concat
       speecht5_train_spk_pool_gap_sec: 0.25

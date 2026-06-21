@@ -202,6 +202,57 @@ def load_reference_map(metrics_dir: Path, explicit_path: Optional[str]) -> Dict[
 # Whisper via generate() + processor: evita o pipeline ASR recente que em Windows pode exigir TorchCodec.
 _whisper_bundle: Optional[Tuple[Any, Any, str]] = None
 
+_WHISPER_GET_PROMPT_IDS_FAILURE_LOGGED: set[str] = set()
+
+_DEFAULT_PT_SOFT_TRANSCRIBE_PROMPT = (
+    "Transcreve apenas em português; não traduzas para inglês nem para outras línguas. "
+    "Para números, datas e percentagens, tenta usar palavras em português, como falado oralmente "
+    "(por extenso), em vez de algarismos. "
+    "Transcrição: no dia vinte e cinco de abril, vinte e dois alunos compareceram."
+)
+
+_PROMPT_AUTOMATICO = "_auto"
+
+
+def _whisper_vocab_excludes_digit_tokens(model_id: str) -> bool:
+    """
+    Modelos tipo «no-numbers» removem os tokens de dígitos do decoder.
+    ``get_prompt_ids`` pode falhar (Token `1` out of vocabulary); usar só ``language`` + ``task``.
+    """
+    mid = (model_id or "").lower()
+    return "no-numbers" in mid or "no_numbers" in mid
+
+
+def _language_is_portuguese(lang: Optional[str]) -> bool:
+    """True quando pedimos Whisper em português (prompt suave WER/CER compatível com texto por extenso)."""
+    if not lang or not str(lang).strip():
+        return False
+    s = str(lang).strip().lower()
+    if len(s) >= 2 and s[:2] == "pt":
+        return True
+    return s in {
+        "portuguese",
+        "português",
+        "portugues",
+        "brazil",
+        "brasil",
+        "brazilian",
+        "portuguese_brazil",
+        "portuguese-brazil",
+    }
+
+
+def _whisper_cap_max_new_tokens(model: Any, gen_kw: Dict[str, Any]) -> None:
+    """Garante ``decoder_tokens_iniciais + max_new_tokens`` ≤ ``max_target_positions`` (~448)."""
+    max_pos = int(getattr(model.config, "max_target_positions", 448))
+    default_ceiling = min(440, max_pos - 8)
+    if gen_kw.get("prompt_ids") is None:
+        gen_kw["max_new_tokens"] = default_ceiling
+        return
+    pn = int(gen_kw["prompt_ids"].numel())
+    overhead = max(52, pn // 2)
+    gen_kw["max_new_tokens"] = max(64, min(default_ceiling, max_pos - pn - overhead))
+
 
 def _whisper_model_and_processor(model_id: str, device: str) -> Tuple[Any, Any]:
     global _whisper_bundle
@@ -237,26 +288,24 @@ def _whisper_model_and_processor(model_id: str, device: str) -> Tuple[Any, Any]:
     return processor, model
 
 
-def _whisper_forced_decoder_ids(processor: Any, language: Optional[str]) -> Optional[Any]:
-    if not language:
-        return None
-    fn = getattr(processor, "get_decoder_prompt_ids", None)
-    if callable(fn):
-        return fn(language=language, task="transcribe")
-    tok = getattr(processor, "tokenizer", None)
-    fn2 = getattr(tok, "get_decoder_prompt_ids", None) if tok is not None else None
-    if callable(fn2):
-        return fn2(language=language, task="transcribe")
-    return None
-
-
 def transcribe_wav(
     wav_path: Path,
     *,
     language: Optional[str],
     model_id: str,
     device: str,
+    transcribe_prompt: Optional[str] = _PROMPT_AUTOMATICO,
 ) -> str:
+    """
+    Transcrição com Whisper (HF). Usa ``task="transcribe"`` e ``language=...`` em ``generate`` (Transformers 5.x),
+    em vez de só ``forced_decoder_ids``, para reforçar **não traduzir** para outra língua.
+
+    ``transcribe_prompt``:
+      - omissão (valor interno `_PROMPT_AUTOMATICO`): se ``language`` for português, texto curto com pedido por extenso
+        (**desligado** em checkpoints ``no-numbers``: o modelo já evita dígitos; texto auxiliar rebenta no tokenizer).
+      - ``None`` ou ``""``: sem este condicionamento.
+      - outra string: passa a ``processor.get_prompt_ids`` (condicionamento leve).
+    """
     import torch
 
     processor, model = _whisper_model_and_processor(model_id, device)
@@ -264,11 +313,38 @@ def transcribe_wav(
     y = np.asarray(y, dtype=np.float32).reshape(-1)
     inputs = processor(y, sampling_rate=16000, return_tensors="pt")
     input_features = inputs.input_features.to(model.device, dtype=model.dtype)
-    forced = _whisper_forced_decoder_ids(processor, language)
-    # Whisper large: contexto ~448; forced_decoder_ids consome alguns tokens — não usar 448 «cheios».
-    gen_kw: Dict[str, Any] = {"max_new_tokens": 440}
-    if forced is not None:
-        gen_kw["forced_decoder_ids"] = forced
+    # Transformers 5.x: task/language aplicados em generate repercutem melhor «transcrever PT» vs tradução implícita.
+    gen_kw: Dict[str, Any] = {"task": "transcribe"}
+    if language and str(language).strip():
+        gen_kw["language"] = str(language).strip()
+
+    no_digit_vocab = _whisper_vocab_excludes_digit_tokens(model_id)
+
+    prompt_text: Optional[str] = None
+    if transcribe_prompt is None or transcribe_prompt == "":
+        prompt_text = None
+    elif transcribe_prompt == _PROMPT_AUTOMATICO:
+        if no_digit_vocab:
+            prompt_text = None
+        elif _language_is_portuguese(language):
+            prompt_text = _DEFAULT_PT_SOFT_TRANSCRIBE_PROMPT
+    else:
+        prompt_text = str(transcribe_prompt).strip() or None
+    if prompt_text:
+        try:
+            pid = processor.get_prompt_ids(prompt_text)
+            gen_kw["prompt_ids"] = torch.tensor(pid, dtype=torch.long, device=model.device)
+        except Exception as exc:
+            mid = str(model_id)
+            if mid not in _WHISPER_GET_PROMPT_IDS_FAILURE_LOGGED:
+                _WHISPER_GET_PROMPT_IDS_FAILURE_LOGGED.add(mid)
+                print(
+                    f"[Whisper AVISO] prompt_ids omitido para {model_id!r}: {exc}",
+                    file=sys.stderr,
+                )
+
+    _whisper_cap_max_new_tokens(model, gen_kw)
+
     with torch.no_grad():
         ids = model.generate(input_features, **gen_kw)
     text = processor.batch_decode(ids, skip_special_tokens=True)[0]
@@ -437,7 +513,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--whisper-model",
         type=str,
-        default="openai/whisper-small",
+        default="openai/whisper-large-v3",
         help="Checkpoint Hugging Face para ASR.",
     )
     parser.add_argument("--device", type=str, default="cuda", help="cuda | cpu ou índice GPU.")

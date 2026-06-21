@@ -52,6 +52,8 @@ def inference_pair_prefix_sort_key(prefix: str) -> Tuple[int, int, str]:
         return (99, 0, "")
     if p.lower() == "custom":
         return (-1, 0, p)
+    if p.upper() == "MEDIA":
+        return (100, 0, p)
     m = re.match(r"(?i)^sentenca_(\d+)$", p)
     if m:
         return (0, int(m.group(1)), p)
@@ -184,6 +186,20 @@ def find_referencia_path(out_dir: Path, prefix: str) -> Optional[Path]:
     return candidates[0]
 
 
+_DEFAULT_TEXTS_TRIPLE_WAV_PREFIX_TAGS: Tuple[str, ...] = ("_sem_embedding", "_base_treino", "_base_teste")
+
+
+def wav_pair_prefix_without_triple_emb_tag(pair_prefix: str) -> Optional[str]:
+    """
+    Inferência ``default_texts`` tripla: prefixo do WAV = ``sentenca_N_<rótulo>``.
+    ``sentenca_4_base_treino`` → ``sentenca_4`` (onde costuma estar o .txt da frase sintetizada).
+    """
+    for suf in _DEFAULT_TEXTS_TRIPLE_WAV_PREFIX_TAGS:
+        if pair_prefix.endswith(suf):
+            return pair_prefix[: -len(suf)]
+    return None
+
+
 def treinado_nr_wav_path(out_dir: Path, prefix: str) -> Path:
     """Ficheiro opcional gravado na inferência com ``--noise_reduce``: ``{prefix}_treinado_nr.wav``."""
     return out_dir / f"{prefix}_treinado_nr.wav"
@@ -274,7 +290,7 @@ def compute_metrics_for_inference_dir(
     nr_prop_decrease: float = DEFAULT_NR_PROP_DECREASE,
     nr_peak_match: bool = DEFAULT_NR_PEAK_MATCH,
     wer_cer: bool = False,
-    whisper_model: str = "openai/whisper-small",
+    whisper_model: str = "openai/whisper-large-v3",
     whisper_language: str = "portuguese",
     asr_device: str = "cuda",
     references_map: Optional[Dict[str, str]] = None,
@@ -400,6 +416,13 @@ def compute_metrics_for_inference_dir(
                     ref_text_for_wer = rtxt.read_text(encoding="utf-8").strip()
 
                 if not ref_text_for_wer:
+                    stripped_pf = wav_pair_prefix_without_triple_emb_tag(prefix)
+                    if stripped_pf:
+                        tp3 = out_dir / f"{stripped_pf}.txt"
+                        if tp3.is_file():
+                            ref_text_for_wer = tp3.read_text(encoding="utf-8").strip()
+
+                if not ref_text_for_wer:
                     errs.append("sem_texto_referencia_wer_cer")
                 else:
                     try:
@@ -443,10 +466,37 @@ INFERENCE_METRICS_CSV_COLUMN_ORDER: List[str] = [
 ]
 
 
-def write_metrics_csv(rows: List[Dict[str, Any]], out_csv: Path | str) -> None:
+def build_inference_metrics_mean_row(
+    rows: List[Dict[str, Any]],
+    fieldnames: List[str],
+    *,
+    label: str = "MEDIA",
+) -> Dict[str, Any]:
+    """Linha de resumo: média por coluna numérica; demais campos vazios."""
+    mean_row: Dict[str, Any] = {"pair_prefix": label}
+    for key in fieldnames:
+        if key == "pair_prefix":
+            continue
+        mean, n = _mean_column(rows, key)
+        if n > 0 and np.isfinite(mean):
+            mean_row[key] = mean
+        else:
+            mean_row[key] = ""
+    return mean_row
+
+
+def write_metrics_csv(
+    rows: List[Dict[str, Any]],
+    out_csv: Path | str,
+    *,
+    append_mean_row: bool = True,
+) -> None:
     out_csv = Path(out_csv)
+    data_rows = [
+        r for r in rows if str(r.get("pair_prefix", "") or "").strip().upper() != "MEDIA"
+    ]
     rows_sorted = sorted(
-        rows,
+        data_rows,
         key=lambda r: inference_pair_prefix_sort_key(str(r.get("pair_prefix", "") or "")),
     )
     keys: set[str] = set()
@@ -465,6 +515,8 @@ def write_metrics_csv(rows: List[Dict[str, Any]], out_csv: Path | str) -> None:
         w.writeheader()
         for row in rows_sorted:
             w.writerow(row)
+        if append_mean_row and rows_sorted:
+            w.writerow(build_inference_metrics_mean_row(rows_sorted, ordered))
 
 
 def _mean_column(rows: List[Dict[str, Any]], key: str) -> Tuple[float, int]:
@@ -543,7 +595,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.set_defaults(compute_f0=True)
     parser.add_argument("--wer-cer", dest="wer_cer", action="store_true", help="WER/CER com Whisper + texto de referência.")
-    parser.add_argument("--wer_cer_whisper_model", type=str, default="openai/whisper-small")
+    parser.add_argument("--wer_cer_whisper_model", type=str, default="openai/whisper-large-v3")
     parser.add_argument("--wer_cer_whisper_language", type=str, default="portuguese")
     parser.add_argument(
         "--wer_cer_device",

@@ -5,9 +5,11 @@
 # Valores "desligado": flags false, high-pass 0 dB, treble_boost 0, apenas métricas opcionais sem só-dir, etc.
 
 # --- Pedido explícito (seu run de referência) ---
-model_path: "./output_cuda_16gb_fs2/fastspeech2-lapsbm_fastspeech2-2026-05-06-19-43-18/checkpoint-7800"
+#model_path: "./output_cuda_16gb/speecht5-lapsbm_speecht5-2026-05-01-00-37-27/checkpoint-9900"
+model_path: "./output_cuda_16gb/speecht5-lapsbm_speecht5-2026-06-20-00-26-33/checkpoint-9100"
+profile: cuda_16gb
 profile: cuda_16gb_fs2
-dataset: lapsbm_fastspeech2
+dataset: lapsbm_speecht5
 config: config_train.yaml
 compute_wer_cer: true
 compute_f0_rmse: true
@@ -61,7 +63,8 @@ dataset_train_sentence_limit: 5
 no_mp3: true
 mp3_bitrate: 192k
 
-# --- SpeechT5: locutor / chunks ---
+# --- SpeechT5: apenas default_texts, 3 × condicionamentos (treino/teste/longest/ref log) ---
+default_texts_triple_speaker_embedding: false
 speecht5_zero_speaker_embedding: false
 use_test_embeddings: false
 use_test_embeddings_dir: "./embeddings_test_speakers"
