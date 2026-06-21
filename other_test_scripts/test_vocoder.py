@@ -1,9 +1,16 @@
 import torch
-from transformers import SpeechT5HifiGan
-from datasets import load_dataset, Audio
-import librosa
 import numpy as np
 import soundfile as sf
+import sys
+from pathlib import Path
+from datasets import load_dataset, Audio
+from transformers import SpeechT5Processor, SpeechT5HifiGan
+import librosa
+
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+from speecht5_mel_utils import waveform_to_speecht5_label_tensor
 
 def main():
     print("🔊 Testing Vocoder Compatibility...")
@@ -11,6 +18,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device)
     vocoder.eval()
+
+    processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
 
     # Load Sample
     dataset = load_dataset("falabrasil/lapsbm", split="test", streaming=False)
@@ -74,8 +83,16 @@ def main():
         if out_audio3.dim() > 1:
             out_audio3 = out_audio3.squeeze()
         
-    sf.write("vocoder_output_method3.wav", out_audio3.cpu().numpy(), 16000)
-    print("Saved 'vocoder_output_method3.wav'")
-
-if __name__ == "__main__":
+    # --- 4. Training-aligned (SpeechT5FeatureExtractor → mesma escala que train_exhaustive) ---
+    print("\n--- Method 4: SpeechT5FeatureExtractor (alinhado ao treino HF) ---")
+    sample_f32 = np.asarray(sample, dtype=np.float32).reshape(-1)
+    lab = waveform_to_speecht5_label_tensor(sample_f32, processor.feature_extractor, 16000)
+    tensor_mel4 = lab.unsqueeze(0).to(device)
+    print(f"Spectrogram Shape: {tensor_mel4.shape}")
+    with torch.no_grad():
+        out_audio4 = vocoder(tensor_mel4)
+        if out_audio4.dim() > 1:
+            out_audio4 = out_audio4.squeeze()
+    sf.write("vocoder_output_method4_hf_labels.wav", out_audio4.cpu().numpy(), 16000)
+    print("Saved 'vocoder_output_method4_hf_labels.wav'")
     main()
