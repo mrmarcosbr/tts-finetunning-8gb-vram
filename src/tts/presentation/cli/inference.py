@@ -9,13 +9,17 @@ sys.modules.setdefault("torchcodec", None)
 
 import repo_bootstrap  # noqa: F401
 from tts.core.patches import apply_runtime_patches, configure_runtime_warning_filters
-from tts.core.torch_compat import import_distributed_tensor_early
+from tts.core.torch_compat import (
+    bypass_transformers_torch_version_guard,
+    import_distributed_tensor_early,
+)
 
 load_dotenv()
 
 configure_runtime_warning_filters()
 apply_runtime_patches()
 import_distributed_tensor_early()
+bypass_transformers_torch_version_guard()
 
 from tts.application.inference.pipeline import main
 
